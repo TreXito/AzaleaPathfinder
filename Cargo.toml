@@ -1,0 +1,10 @@
+[package]
+name = "azalea-pathfinder"
+version = "0.1.0"
+edition = "2024"
+description = "Reusable block pathfinding and navigation plugin for Azalea clients"
+
+[dependencies]
+azalea = { git = "https://github.com/RaymondShell/azalea", branch = "main" }
+bevy_ecs = "0.19"
+parking_lot = "0.12.5"
