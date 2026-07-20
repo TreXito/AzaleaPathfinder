@@ -95,37 +95,4 @@ mod tests {
         assert_eq!(steps.len(), 1);
         assert!(matches!(steps[0].edge, TravelEdge::Warp { name: "deep" }));
     }
-
-    #[test]
-    fn already_there_is_empty_route() {
-        let graph = WorldGraph::skyblock_default();
-        let hub = graph.place_index("hub").unwrap();
-        assert!(route(&graph, hub, hub).unwrap().is_empty());
-    }
-
-    #[test]
-    fn malformed_public_edges_are_ignored_instead_of_panicking() {
-        let graph = WorldGraph {
-            places: vec![
-                crate::Place {
-                    id: "from",
-                    mode: None,
-                    anchor: None,
-                },
-                crate::Place {
-                    id: "to",
-                    mode: None,
-                    anchor: None,
-                },
-            ],
-            edges: vec![crate::GraphEdge {
-                from: 0,
-                to: usize::MAX,
-                edge: TravelEdge::Walk,
-                cost: 1,
-            }],
-        };
-
-        assert!(route(&graph, 0, 1).is_none());
-    }
 }

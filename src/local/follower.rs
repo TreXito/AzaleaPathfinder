@@ -528,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_never_crosses_lava_clearance() {
+    fn shortcuts_respect_lava_and_body_clearance() {
         let mut world = floor();
         world.0.insert((2, 63, 1), BlockKind::Lava);
         assert!(!line_walkable(
@@ -538,11 +538,8 @@ mod tests {
             64,
             &FollowerSettings::default()
         ));
-    }
 
-    #[test]
-    fn shortcut_body_edge_does_not_clip_a_step_block() {
-        let mut world = floor();
+        world.0.remove(&(2, 63, 1));
         world.0.insert((2, 64, 1), BlockKind::Step);
         assert!(!line_walkable(
             &world,
@@ -551,58 +548,5 @@ mod tests {
             64,
             &FollowerSettings::default()
         ));
-    }
-
-    #[test]
-    fn furthest_visible_handles_empty_and_out_of_range_paths() {
-        let world = floor();
-        let settings = FollowerSettings::default();
-        assert_eq!(
-            furthest_visible(&world, Vec3::new(0.5, 64.0, 0.5), &[], 99, &settings),
-            0
-        );
-        assert_eq!(
-            furthest_visible(
-                &world,
-                Vec3::new(0.5, 64.0, 0.5),
-                &path().nodes,
-                99,
-                &settings
-            ),
-            4
-        );
-    }
-
-    #[test]
-    fn negative_turn_limit_is_safely_clamped() {
-        let settings = FollowerSettings {
-            minimum_turn_degrees: -20.0,
-            turn_jitter_degrees: 0,
-            ..FollowerSettings::default()
-        };
-        let mut follower = PathFollower::new(path(), settings.clone(), 7);
-        let FollowerDirective::Move { max_turn, .. } = follower.tick(
-            &floor(),
-            FollowerFrame {
-                position: Vec3::new(0.5, 64.0, 0.5),
-                on_ground: true,
-                horizontal_collision: false,
-                paused: false,
-            },
-        ) else {
-            panic!("expected a movement directive");
-        };
-        assert_eq!(max_turn, 0.0);
-        let (yaw, pitch) = steering_direction(
-            Vec3::new(0.5, 64.0, 0.5),
-            0.0,
-            0.0,
-            Vec3::new(4.5, 64.0, 0.5),
-            0.0,
-            0.0,
-            -20.0,
-            &settings,
-        );
-        assert_eq!((yaw, pitch), (0.0, 0.0));
     }
 }

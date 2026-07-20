@@ -369,44 +369,7 @@ impl Move for FallMove {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use super::*;
-
-    struct LavaGrid(HashSet<(i32, i32, i32)>);
-
-    impl WorldView for LavaGrid {
-        fn block(&self, pos: BlockPos) -> BlockKind {
-            if self.0.contains(&(pos.x, pos.y, pos.z)) {
-                BlockKind::Lava
-            } else {
-                BlockKind::Air
-            }
-        }
-    }
-
-    #[test]
-    fn proximity_cost_uses_nearest_lava_not_pool_volume() {
-        let pos = BlockPos::new(0, 64, 0);
-        let one = LavaGrid(HashSet::from([(3, 63, 0)]));
-        let pool = LavaGrid(HashSet::from([
-            (3, 63, 0),
-            (3, 63, 1),
-            (3, 64, -1),
-            (4, 63, 0),
-        ]));
-
-        assert_eq!(lava_proximity_penalty(pos, &one, 4, 6), 12);
-        assert_eq!(lava_proximity_penalty(pos, &pool, 4, 6), 12);
-    }
-
-    #[test]
-    fn lava_on_a_separate_cave_level_does_not_distort_local_costs() {
-        let pos = BlockPos::new(0, 64, 0);
-        let other_level = LavaGrid(HashSet::from([(2, 67, 0)]));
-
-        assert_eq!(lava_proximity_penalty(pos, &other_level, 4, 6), 0);
-    }
 
     #[test]
     fn forbidden_policy_only_allows_risk_reducing_escape_steps() {

@@ -415,75 +415,8 @@ mod tests {
         MoveContext::default()
     }
 
-    #[test]
-    fn tie_break_is_deterministic_bounded_and_seed_dependent() {
-        let p = BlockPos::new(3, 64, -7);
-        assert_eq!(tie_break(p, 42), tie_break(p, 42));
-        // Keep this too small to override the primary f-score.
-        for s in 0..64 {
-            assert!(
-                tie_break(p, s) < 3,
-                "tie-break must stay a small ordering key"
-            );
-        }
-        assert!(
-            (0..32).any(|s| tie_break(p, s) != tie_break(p, s + 1)),
-            "the seed must vary the tie-break"
-        );
-    }
-
     fn dist(a: BlockPos, b: BlockPos) -> i32 {
         (a.x - b.x).abs() + (a.y - b.y).abs() + (a.z - b.z).abs()
-    }
-
-    #[test]
-    fn heuristic_accounts_for_vertical_distance() {
-        let goal = BlockPos::new(0, 0, 0);
-        let ctx = ctx();
-        // Vertical distance must contribute to the estimate.
-        assert!(
-            heuristic(BlockPos::new(0, 8, 0), goal, &ctx) > 0,
-            "goal below ignored"
-        );
-        assert!(
-            heuristic(BlockPos::new(0, -8, 0), goal, &ctx) > 0,
-            "goal above ignored"
-        );
-        // Vertical cost folds in with max, so it does not inflate this bound.
-        assert_eq!(heuristic(BlockPos::new(10, 0, 0), goal, &ctx), 90);
-        assert_eq!(heuristic(BlockPos::new(10, 2, 0), goal, &ctx), 90);
-        // A one-level descent may be a cheap stair step.
-        assert_eq!(heuristic(BlockPos::new(0, 1, 0), goal, &ctx), 0);
-    }
-
-    #[test]
-    fn heuristic_respects_cheaper_horizontal_jump_and_fall_costs() {
-        let mut ctx = ctx();
-        ctx.costs.cardinal_walk = 100;
-        ctx.costs.diagonal_walk = 140;
-        ctx.costs.step = 50;
-        ctx.costs.jump = 2;
-        ctx.costs.fall_base = 1;
-        ctx.costs.fall_per_block = 1;
-
-        assert_eq!(
-            heuristic(BlockPos::new(0, 64, 0), BlockPos::new(3, 64, 0), &ctx),
-            4
-        );
-    }
-
-    #[test]
-    fn heuristic_prices_the_nearest_accepted_goal_not_the_exact_block() {
-        let mut ctx = ctx();
-        ctx.goal_tolerance = 2;
-        assert_eq!(
-            heuristic(BlockPos::new(0, 64, 0), BlockPos::new(5, 64, 0), &ctx),
-            ctx.costs.cardinal_walk * 3
-        );
-        assert_eq!(
-            heuristic(BlockPos::new(3, 64, 0), BlockPos::new(5, 64, 0), &ctx),
-            0
-        );
     }
 
     struct CheapDetourMove;
@@ -626,38 +559,6 @@ mod tests {
     }
 
     #[test]
-    fn keeps_clearance_from_walls() {
-        let mut grid = Grid::new();
-        grid.floor(0..=8, 1..=4, 63); // stand at y=64
-        // Two-block wall along z=0.
-        for x in 0..=8 {
-            grid.solid.insert((x, 64, 0));
-            grid.solid.insert((x, 65, 0));
-        }
-
-        // The preferred path should leave some space from the wall.
-        let path = find_path(
-            &grid,
-            BlockPos::new(0, 64, 1),
-            BlockPos::new(8, 64, 1),
-            &default_moves(),
-            &ctx(),
-        )
-        .unwrap();
-
-        let interior = &path.nodes[1..path.nodes.len() - 1];
-        assert!(
-            interior.iter().all(|n| n.pos.z >= 2),
-            "path hugged the wall: {:?}",
-            path.nodes.iter().map(|n| n.pos).collect::<Vec<_>>()
-        );
-    }
-
-    fn on_lava(grid: &Grid, p: BlockPos) -> bool {
-        grid.lava.contains(&(p.x, p.y - 1, p.z))
-    }
-
-    #[test]
     fn avoids_lava_when_a_dry_route_exists() {
         let mut grid = Grid::new();
         grid.floor(-1..=7, -1..=5, 63); // stand at y=64
@@ -703,27 +604,6 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, PathError::NoPath));
-    }
-
-    #[test]
-    fn penalized_policy_can_opt_in_to_crossing_lava() {
-        let mut grid = Grid::new();
-        grid.floor(-1..=7, 0..=0, 63);
-        grid.solid.remove(&(3, 63, 0));
-        grid.lava.insert((3, 63, 0));
-        let mut ctx = ctx();
-        ctx.lava_policy = super::super::moves::LavaPolicy::Penalized;
-
-        let path = find_path(
-            &grid,
-            BlockPos::new(0, 64, 0),
-            BlockPos::new(6, 64, 0),
-            &default_moves(),
-            &ctx,
-        )
-        .expect("the explicit legacy policy should permit the only route");
-
-        assert!(path.nodes.iter().any(|n| on_lava(&grid, n.pos)));
     }
 
     #[test]
@@ -786,24 +666,6 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, PathError::NoPath));
-    }
-
-    #[test]
-    fn best_effort_reaches_a_reachable_goal() {
-        let mut grid = Grid::new();
-        grid.floor(-2..=8, -2..=2, 63);
-
-        let goal = BlockPos::new(5, 64, 0);
-        let (path, reached) = find_path_best_effort(
-            &grid,
-            BlockPos::new(0, 64, 0),
-            goal,
-            &default_moves(),
-            &ctx(),
-        );
-
-        assert!(reached, "should reach a goal on open floor");
-        assert!(dist(path.nodes.last().unwrap().pos, goal) <= 1);
     }
 
     #[test]

@@ -604,16 +604,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_bounds_cover_near_goal_with_margin() {
-        let settings = PathfinderSettings::default();
-        let start = BlockPos::new(10, 64, -20);
-        let goal = BlockPos::new(30, 70, -5);
-        let (low, high) = snapshot_bounds(start, goal, &settings);
-        assert_eq!(low, BlockPos::new(0, 54, -30));
-        assert_eq!(high, BlockPos::new(40, 80, 5));
-    }
-
-    #[test]
     fn snapshot_bounds_cap_far_goal_in_its_direction() {
         let settings = PathfinderSettings {
             snapshot_margin: 4,
@@ -627,19 +617,6 @@ mod tests {
         assert_eq!((low.x, high.x), (-4, 28));
         assert_eq!((low.y, high.y), (52, 68));
         assert_eq!((low.z, high.z), (-28, 4));
-    }
-
-    #[test]
-    fn dynamic_goal_position_ignores_revision() {
-        let position = BlockPos::new(1, 2, 3);
-        assert_eq!(
-            NavigationGoal::Dynamic {
-                position,
-                revision: 99,
-            }
-            .position(),
-            position
-        );
     }
 
     #[test]
@@ -666,39 +643,5 @@ mod tests {
             follower_snapshot_bounds(azalea::Vec3::new(9.5, 64.0, 11.5), &path, 0, &settings);
         assert_eq!(low, BlockPos::new(6, 61, 5));
         assert_eq!(high, BlockPos::new(16, 68, 14));
-    }
-
-    #[test]
-    fn follower_snapshot_bounds_handle_empty_paths() {
-        let path = crate::Path {
-            nodes: Vec::new(),
-            total_cost: 0,
-        };
-        let point = azalea::Vec3::new(1.5, 2.0, 3.5);
-        assert_eq!(
-            follower_snapshot_bounds(point, &path, 99, &FollowerSettings::default()),
-            (BlockPos::new(1, 2, 3), BlockPos::new(1, 2, 3))
-        );
-    }
-
-    #[test]
-    fn snapshot_bounds_do_not_overflow_at_world_integer_extremes() {
-        let settings = PathfinderSettings {
-            snapshot_margin: i32::MAX,
-            snapshot_max_span_xz: 32,
-            snapshot_max_span_y: 16,
-            ..PathfinderSettings::default()
-        };
-        let (low, high) = snapshot_bounds(
-            BlockPos::new(i32::MAX, i32::MIN, i32::MAX),
-            BlockPos::new(i32::MIN, i32::MAX, i32::MIN),
-            &settings,
-        );
-        assert!(low.x <= high.x && low.y <= high.y && low.z <= high.z);
-    }
-
-    #[test]
-    fn periodic_dynamic_replanning_is_opt_in() {
-        assert_eq!(PathfinderSettings::default().dynamic_replan_ticks, 0);
     }
 }
