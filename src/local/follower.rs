@@ -186,6 +186,26 @@ impl PathFollower {
         }
 
         let nodes = &self.path.nodes;
+        // The server can correct/knock the player behind the follower's
+        // monotonic cursor while movement is paused for combat. If the direct
+        // transition to that stale cursor now crosses lava, re-anchor to the
+        // closest earlier path node that is both nearby and safely reachable.
+        // Without this, a perfectly valid path is abandoned because the
+        // follower tries to cut straight across the intervening terrain.
+        if !live_next_node_is_safe(
+            world,
+            frame.position,
+            nodes[self.idx].pos,
+            self.settings.lava_policy,
+            self.settings.line_sample_spacing,
+        ) && let Some(reanchored) =
+            nearest_safe_prefix_node(world, frame.position, nodes, self.idx, &self.settings)
+        {
+            self.idx = reanchored;
+            self.last_progress_idx = reanchored;
+            self.stalled = 0;
+        }
+
         while self.idx + 1 < nodes.len() {
             let current = node_center(nodes[self.idx].pos);
             let next = node_center(nodes[self.idx + 1].pos);
@@ -194,7 +214,18 @@ impl PathFollower {
             let past = dist_xz(frame.position, current)
                 < self.settings.passed_node_radius_xz.max(0.0)
                 && passed(frame.position, current, next);
-            if close || past {
+            // A planned node can be safe while the player's off-centre live
+            // position makes a diagonal cut to the following node unsafe.
+            // First steer back onto the safe node; advancing here would skip
+            // that protection and immediately produce an Unsafe directive.
+            let next_is_safe = live_next_node_is_safe(
+                world,
+                frame.position,
+                nodes[self.idx + 1].pos,
+                self.settings.lava_policy,
+                self.settings.line_sample_spacing,
+            );
+            if (close || past) && next_is_safe {
                 self.idx += 1;
             } else {
                 break;
@@ -414,6 +445,35 @@ fn live_next_node_is_safe(
     })
 }
 
+fn nearest_safe_prefix_node(
+    world: &dyn WorldView,
+    position: Vec3,
+    nodes: &[PathNode],
+    idx: usize,
+    settings: &FollowerSettings,
+) -> Option<usize> {
+    let max_xz = settings
+        .passed_node_radius_xz
+        .max(settings.node_radius_xz)
+        .max(0.0);
+    let max_y = settings
+        .node_y_tolerance
+        .max(settings.arrival_y_tolerance)
+        .max(0.0);
+    (0..idx).rev().find(|&candidate| {
+        let target = node_center(nodes[candidate].pos);
+        dist_xz(position, target) <= max_xz
+            && (position.y - target.y).abs() <= max_y
+            && live_next_node_is_safe(
+                world,
+                position,
+                nodes[candidate].pos,
+                settings.lava_policy,
+                settings.line_sample_spacing,
+            )
+    })
+}
+
 fn position_lava_risk(world: &dyn WorldView, pos: BlockPos, policy: LavaPolicy) -> u32 {
     match policy {
         LavaPolicy::Forbidden { clearance } => lava_risk(pos, world, clearance),
@@ -497,6 +557,22 @@ mod tests {
         }
     }
 
+    fn path_to(x_end: i32) -> Path {
+        Path {
+            nodes: (0..=x_end)
+                .map(|x| PathNode {
+                    pos: BlockPos::new(x, 64, 0),
+                    reached_by: if x == 0 {
+                        crate::MoveKind::Start
+                    } else {
+                        crate::MoveKind::Walk
+                    },
+                })
+                .collect(),
+            total_cost: x_end as u32 * 10,
+        }
+    }
+
     #[test]
     fn follower_arrives_and_pauses_without_stalling() {
         let world = floor();
@@ -548,5 +624,89 @@ mod tests {
             64,
             &FollowerSettings::default()
         ));
+    }
+
+    #[test]
+    fn unsafe_following_transition_keeps_the_current_safe_node() {
+        let mut world = floor();
+        world.0.insert((1, 63, 1), BlockKind::Solid);
+        world.0.insert((1, 63, 2), BlockKind::Lava);
+        let path = Path {
+            nodes: vec![
+                PathNode {
+                    pos: BlockPos::new(0, 64, 0),
+                    reached_by: crate::MoveKind::Start,
+                },
+                PathNode {
+                    pos: BlockPos::new(1, 64, 0),
+                    reached_by: crate::MoveKind::Walk,
+                },
+                PathNode {
+                    pos: BlockPos::new(1, 64, 2),
+                    reached_by: crate::MoveKind::Walk,
+                },
+            ],
+            total_cost: 20,
+        };
+        let settings = FollowerSettings {
+            lava_policy: LavaPolicy::Forbidden { clearance: 0 },
+            max_los_skip: 0,
+            ..FollowerSettings::default()
+        };
+        let mut follower = PathFollower::new(path, settings, 7);
+
+        let directive = follower.tick(
+            &world,
+            FollowerFrame {
+                position: Vec3::new(1.3, 64.0, 0.5),
+                on_ground: true,
+                horizontal_collision: false,
+                paused: false,
+            },
+        );
+
+        assert_eq!(follower.current_node_index(), 1);
+        assert!(matches!(
+            directive,
+            FollowerDirective::Move { target, .. }
+                if target == Vec3::new(1.5, 64.0, 0.5)
+        ));
+    }
+
+    #[test]
+    fn server_setback_reanchors_before_crossing_new_lava() {
+        let mut world = Grid((-2..=10).map(|x| ((x, 63, 0), BlockKind::Solid)).collect());
+        let settings = FollowerSettings {
+            lava_policy: LavaPolicy::Forbidden { clearance: 0 },
+            max_los_skip: 0,
+            ..FollowerSettings::default()
+        };
+        let mut follower = PathFollower::new(path_to(8), settings, 7);
+        for x in 1..=5 {
+            let _ = follower.tick(
+                &world,
+                FollowerFrame {
+                    position: Vec3::new(x as f64 + 0.5, 64.0, 0.5),
+                    on_ground: true,
+                    horizontal_collision: false,
+                    paused: false,
+                },
+            );
+        }
+        assert!(follower.current_node_index() >= 5);
+
+        world.0.insert((3, 63, 0), BlockKind::Lava);
+        let directive = follower.tick(
+            &world,
+            FollowerFrame {
+                position: Vec3::new(1.5, 64.0, 0.5),
+                on_ground: true,
+                horizontal_collision: false,
+                paused: false,
+            },
+        );
+
+        assert!(follower.current_node_index() <= 2);
+        assert!(!matches!(directive, FollowerDirective::Unsafe { .. }));
     }
 }
