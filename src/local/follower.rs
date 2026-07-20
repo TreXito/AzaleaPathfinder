@@ -1,9 +1,4 @@
-//! Reusable, tick-driven path execution.
-//!
-//! The planner produces a corridor; [`PathFollower`] turns live position and
-//! physics samples into movement directives. It deliberately owns no client or
-//! application state, so an Azalea plugin and a larger bot can share exactly
-//! the same arrival, shortcut, lava, and stall rules.
+//! Tick-driven path execution independent of client state.
 
 use azalea::{BlockPos, Vec3};
 
@@ -87,8 +82,7 @@ pub struct FollowerFrame {
     pub position: Vec3,
     pub on_ground: bool,
     pub horizontal_collision: bool,
-    /// Application-owned pauses (combat, menus, health recovery, ...). A pause
-    /// stops input without consuming the stall budget.
+    /// Stops movement without consuming the stall budget.
     pub paused: bool,
 }
 
@@ -372,9 +366,7 @@ pub fn line_walkable(
         ] {
             let x = (cx + perp_x * side).floor() as i32;
             let z = (cz + perp_z * side).floor() as i32;
-            // A slab/stair at the body's lower edge still collides even though
-            // it is a valid center-line foothold. At head height only full
-            // solids and fences block the body.
+            // Steps block the body's edge at foot height, but not at head height.
             if matches!(
                 world.block(BlockPos::new(x, feet_y, z)),
                 BlockKind::Solid | BlockKind::Fence | BlockKind::Step

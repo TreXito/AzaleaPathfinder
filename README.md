@@ -1,51 +1,17 @@
 # azalea-pathfinder
 
-Block-level pathfinding and high-level travel routing for [Azalea](https://github.com/azalea-rs/azalea) clients.
+Path planning and movement for [Azalea](https://github.com/azalea-rs/azalea) clients.
 
-The bot decides **where** to go; this crate decides **how** to get there. It plans
-routes with an admissible A\* search over a lock-free world snapshot, prices moves
-for conservative (SkyBlock-calibrated) play, and treats lava as a hard hazard by
-default. The planner is independent of any combat, farm, or application state, so
-any Azalea client can plan against it without exposing its own internals.
+It provides:
 
-## Status
+- local A* pathfinding over a snapshot of the loaded world
+- walking, diagonal movement, auto-stepping, jumping, and falling
+- lava avoidance and configurable movement costs
+- partial paths when the destination is not loaded yet
+- a tick-driven path follower with pause, cancel, and replan support
+- a small high-level router for travelling between areas
 
-| Piece | State |
-| --- | --- |
-| Local A\* planner (`find_path`, `find_path_best_effort`) | ✅ Ready, regression tested |
-| World snapshot capture (`WorldSnapshot`) | ✅ Ready |
-| High-level place graph + Dijkstra router (`WorldGraph`, `route`) | ✅ Ready (warp-only starter graph) |
-| Movement cost model + lava safety (`MoveContext`, `LavaPolicy`) | ✅ Ready |
-| Shared tick-driven path follower (`PathFollower`) | ✅ Ready |
-| `AzaleaPathfinderPlugin` execution loop | ✅ Ready — plan, follow, pause, cancel, replan, status |
-| Item teleports (AOTV / Etherwarp) | Optional extension points, disabled by default |
-
-`AzaleaPathfinderPlugin` is operational: a `NavigationRequest` plans on Azalea's
-compute pool, follows the resulting path on game ticks, incrementally replans partial
-routes, honors `NavigationPaused`, and publishes `NavigationStatus`. Applications
-with additional policy can also use the same `PathFollower` engine directly.
-
-## Features
-
-- **Admissible A\*** with vertical guidance, so the search is pulled toward the
-  goal's altitude instead of treating every Y-level as equal — and stays optimal.
-- **Lock-free planning.** A brief read lock copies a bounded cube of the world into
-  an owned dense array; the search then runs holding **no** lock, so a long search
-  can never starve Azalea's tick.
-- **Human-like movement.** Walks, cuts corners on diagonals, auto-steps slabs and
-  stairs instead of hopping them, keeps clearance from walls, and drops off ledges.
-- **Hard lava safety.** By default lava and a two-block clearance buffer are
-  forbidden. If the bot starts inside the buffer, only exposure-reducing escape
-  steps are allowed. A `Penalized` policy is available as an explicit opt-in.
-- **Best-effort routing.** When the goal's chunks aren't loaded yet, the planner
-  returns the closest reachable partial path so the caller can walk toward the goal
-  (loading chunks) and re-plan.
-- **Two-tier navigation.** A tiny place graph routes *between* areas (warps, pads),
-  while the local A\* handles movement *within* the loaded world.
-- **Extensible without touching the core.** New movement abilities are new `Move`
-  implementations; new destinations are new graph data. The A\* core never changes.
-
-## Installation
+## Install
 
 ```toml
 [dependencies]
@@ -54,17 +20,13 @@ azalea-pathfinder = { git = "https://github.com/RaymondShell/AzaleaPathfinder", 
 bevy_ecs = "0.19"
 ```
 
-The direct `bevy_ecs` dependency is required (not optional): the `#[derive(Resource)]`
-macro on `PathfinderSettings` resolves its crate path through it, and its version
-must stay in lockstep with the `bevy_ecs` that Azalea uses (currently `0.19`).
-
-Requires Rust 1.87+ (edition 2024). **Build in release mode for live use** — the
-default search budget (150k node expansions) is generous and is much slower to
-exhaust in a debug build.
+`bevy_ecs` must match the version used by Azalea. The crate currently requires
+Rust 1.87 or newer. Use a release build for live navigation; large searches are
+noticeably slower in debug builds.
 
 ## Quick start
 
-### Register the plugin
+Register the plugin with your client:
 
 ```rust
 use azalea::prelude::*;
@@ -80,10 +42,11 @@ ClientBuilder::new()
     .await?;
 ```
 
-From a client handler, start a route and optionally await its terminal status:
+Start navigation from a client handler:
 
 ```rust
 let generation = 1;
+
 client.start_navigation(NavigationRequest {
     goal: NavigationGoal::Fixed(BlockPos::new(120, 70, -340)),
     path_seed: 0,
@@ -93,181 +56,112 @@ client.start_navigation(NavigationRequest {
 let status = client.wait_for_navigation(generation).await;
 ```
 
-`pause_navigation(true)` stops movement without consuming the stall budget;
-`pause_navigation(false)` resumes, and `cancel_navigation()` stops and removes the
-active request.
+`generation` identifies the request, so results from an older plan cannot replace
+a newer one. Use `pause_navigation(true)`, `pause_navigation(false)`, or
+`cancel_navigation()` to control the active route.
 
-### Plan a local path
+## Planning a path directly
 
-`WorldSnapshot::capture` copies a bounded region under one brief lock, then
-`find_path_best_effort` searches over that owned snapshot.
+Capture an area containing both endpoints, then plan against the snapshot. The
+world lock is only held while the snapshot is copied.
 
 ```rust
 use azalea::BlockPos;
-use azalea_pathfinder::{default_moves, find_path_best_effort, MoveContext, WorldSnapshot};
+use azalea_pathfinder::{
+    MoveContext, WorldSnapshot, default_moves, find_path_best_effort,
+};
 
-// inside a handler holding a `Client`:
-let world = client.world()?;                       // Arc<RwLock<World>>
-let start = BlockPos::from(client.position()?);    // the bot's current block
+let world = client.world()?;
+let start = BlockPos::from(client.position()?);
 let goal = BlockPos::new(120, 70, -340);
+let margin: i32 = 16;
 
-// Size the captured box to CONTAIN both start and goal (+ margin). A box that
-// clips the goal or a corridor makes the search detour around its own edge.
-let margin = 16;
 let lo = BlockPos::new(
-    start.x.min(goal.x) - margin,
-    start.y.min(goal.y) - margin,
-    start.z.min(goal.z) - margin,
+    start.x.min(goal.x).saturating_sub(margin),
+    start.y.min(goal.y).saturating_sub(margin),
+    start.z.min(goal.z).saturating_sub(margin),
 );
 let hi = BlockPos::new(
-    start.x.max(goal.x) + margin,
-    start.y.max(goal.y) + margin,
-    start.z.max(goal.z) + margin,
+    start.x.max(goal.x).saturating_add(margin),
+    start.y.max(goal.y).saturating_add(margin),
+    start.z.max(goal.z).saturating_add(margin),
 );
-let snapshot = WorldSnapshot::capture(&world, lo, hi);
 
-let ctx = MoveContext::default();  // conservative, lava-forbidding SkyBlock defaults
+let snapshot = WorldSnapshot::capture(&world, lo, hi);
 let moves = default_moves();
-let (path, reached) = find_path_best_effort(&snapshot, start, goal, &moves, &ctx);
+let context = MoveContext::default();
+let (path, reached_goal) =
+    find_path_best_effort(&snapshot, start, goal, &moves, &context);
 
 for node in &path.nodes {
     println!("{:?} via {:?}", node.pos, node.reached_by);
 }
-
-if !reached {
-    // Goal was outside the loaded/captured world. Walk this partial path to load
-    // new chunks, then capture + plan again from the new position.
-}
 ```
 
-For a strict "succeed or fail" search (used mainly as the movement-rule test bed),
-use `find_path`, which returns `Result<Path, PathError>` instead of a best-effort
-partial.
+When `reached_goal` is false, the path ends at the closest reachable point. Follow
+it to load more chunks, take another snapshot, and plan again. Use `find_path` if
+you want a strict `Result<Path, PathError>` instead.
 
-### Route between areas
+## Routing between areas
 
-The place graph plans the high-level legs (which warps to take) before the local
-planner handles on-foot movement within each area.
+`WorldGraph` handles coarse travel such as server warps. Local A* handles the walk
+within a loaded area.
 
 ```rust
-use azalea_pathfinder::{route, WorldGraph};
+use azalea_pathfinder::{WorldGraph, route};
 
 let graph = WorldGraph::skyblock_default();
-let from = graph.place_by_mode("hub").unwrap();       // where the bot is (locraw mode)
-let to = graph.place_index("dwarven_mines").unwrap(); // destination
+let from = graph.place_by_mode("hub").unwrap();
+let to = graph.place_index("dwarven_mines").unwrap();
 
-// Cheapest sequence of legs; empty if already there, None if disconnected.
 if let Some(steps) = route(&graph, from, to) {
     for step in steps {
-        // step.edge      -> e.g. TravelEdge::Warp { name } → run `/warp <name>`
-        // step.to_mode   -> the locraw mode expected after this leg (verify it landed)
-        // step.to_anchor -> walk target for Walk edges (the destination's anchor)
+        println!("{:?}", step.edge);
     }
 }
 ```
 
-## How it works
+An empty route means the client is already at the destination. `None` means the
+two places are not connected.
 
-Navigation is split into two layers with a clean boundary:
+## Configuration
 
-```
-NavigationGoal ─▶ router::route  ──▶ high-level legs (warps, pads) between areas
-                                     │
-                                     ▼  (per leg, within the loaded world)
-              WorldSnapshot::capture ─▶ find_path_best_effort ─▶ block-level Path
-```
+`MoveContext::default()` is deliberately cautious. Its main settings are:
 
-### World abstraction
+| Setting | Default | Meaning |
+| --- | ---: | --- |
+| `max_fall` | 3 | Largest allowed drop |
+| `goal_tolerance` | 1 | Manhattan distance accepted as arrival |
+| `max_expansions` | 150,000 | Search node limit |
+| `time_budget_ms` | 2,000 | Search time limit |
+| `wall_penalty` | 2 | Preference for open space |
+| `lava_policy` | forbidden, 2-block clearance | Lava safety rule |
+| `path_seed` | 0 | Tie-breaking between equal-cost routes |
 
-The planner sees the world only through the `WorldView` trait
-(`block(pos) -> BlockKind` plus a default `standable` rule). Blocks are classified
-coarsely:
+The default movement costs are expressed in tenths of a block: cardinal walking
+costs 10, diagonal walking 14, auto-stepping 12, jumping 24, and falling starts at
+14 plus 6 per block.
 
-| `BlockKind` | Meaning |
-| --- | --- |
-| `Air` | Passable / occupiable |
-| `Solid` | Full block: floor, wall, ceiling |
-| `Step` | Bottom slab, bottom stairs, carpet — walked onto without jumping (auto-step) |
-| `Fence` | Fence / wall / fence gate — 1.5 blocks tall: neither passable nor climbable, so the planner routes *around* it |
-| `Lava` | Structurally occupiable so a trapped bot can plan an exit; the lava policy governs entry |
-| `Unloaded` | Missing chunk data — impassable, so paths never leave the known world |
+The plugin also exposes `PathfinderSettings` for snapshot size, follower behaviour,
+partial-path limits, and optional periodic replanning.
 
-Two implementors ship: `WorldView for azalea::world::World` (queries the live world)
-and `WorldSnapshot` (an owned, lock-free copy). **Prefer the snapshot for live use** —
-searching over the live world holds the world read lock in a tight loop for the whole
-search budget, which can starve the tick that needs `world.write()` each frame.
+## Design notes
 
-### Movement rules
+The planner reads blocks through the `WorldView` trait. `WorldSnapshot` is the
+normal choice for live clients because it lets the search run without holding the
+world lock. Unloaded blocks are impassable, while lava is forbidden by default.
 
-Each way of moving is a `Move` implementation that pushes candidate edges. The
-default set is walk, jump, and fall, plus two inert teleport extension points:
+Movement rules implement `Move`. Built-in one-block moves use the A* heuristic.
+Custom moves fall back to Dijkstra unless they explicitly declare that they obey
+the heuristic's assumptions, which keeps long-range or unusually cheap moves
+optimal.
 
-```rust
-pub fn default_moves() -> Vec<Box<dyn Move>>; // Walk, Jump, Fall, (Aotv), (Etherwarp)
-```
+## Current limitations
 
-### Cost model
-
-Costs are in tenths of a block. The defaults deliberately make risky or fidgety
-movement more expensive than plain walking, so paths don't jitter to save a block:
-
-| Move | Cost |
-| --- | --- |
-| Walk (cardinal) | 10 |
-| Walk (diagonal) | 14 |
-| Auto-step (slab/stair) | 12 |
-| Jump up one block | 24 |
-| Fall | 14 + 6 per block dropped |
-| Warp (router) | 200 |
-
-On top of edge costs, a node accrues terrain penalties: a per-adjacent-wall toll
-(drift toward open space) and a distance-weighted lava-proximity toll beyond the
-hard buffer. These only ever *add* cost, so the A\* heuristic stays admissible.
-
-### Tuning (`MoveContext`)
-
-`MoveContext::default()` is calibrated for cautious SkyBlock play. Notable knobs:
-
-| Field | Default | Purpose |
-| --- | --- | --- |
-| `max_fall` | 3 | Max blocks droppable in one fall move |
-| `goal_tolerance` | 1 | Manhattan distance that counts as "arrived" |
-| `max_expansions` | 150_000 | Node-expansion budget before giving up |
-| `time_budget_ms` | 2000 | Wall-clock ceiling for one search |
-| `wall_penalty` | 2 | Extra cost per adjacent wall (0 disables) |
-| `lava_policy` | `Forbidden { clearance: 2 }` | Hard lava exclusion + buffer |
-| `lava_proximity_radius` / `_penalty` | 4 / 6 | Soft avoidance beyond the buffer |
-| `path_seed` | 0 | Varies the route among equal-cost paths (human-like) |
-
-## Extending
-
-### Add a movement ability
-
-Implement `Move` — the A\* core is untouched:
-
-```rust
-use azalea::BlockPos;
-use azalea_pathfinder::local::moves::Edge;
-use azalea_pathfinder::{default_moves, Move, MoveContext, MoveKind, WorldView};
-
-pub struct SprintJumpMove;
-
-impl Move for SprintJumpMove {
-    fn candidates(&self, from: BlockPos, world: &dyn WorldView, ctx: &MoveContext, out: &mut Vec<Edge>) {
-        // for each reachable target `to`:
-        //   out.push(Edge { to, kind: MoveKind::Jump, cost: /* your cost */ });
-    }
-}
-
-let mut moves = default_moves();
-moves.push(Box::new(SprintJumpMove));
-```
-
-### Add a destination
-
-Extend coverage by adding **data**, not code: push `Place`s (with a locraw `mode`
-and/or an anchor) and `GraphEdge`s (`TravelEdge::Warp`, `TeleportPad`, or `Walk`)
-into a `WorldGraph`. `route` already handles every edge type.
+- AOTV and Etherwarp are extension points only; they do not generate moves yet.
+- The bundled SkyBlock graph is a small warp-based starting map, not a complete
+  map of every island and transition.
+- Planning only knows about loaded blocks included in the snapshot.
 
 ## Testing
 
@@ -276,19 +170,6 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-The tests build hand-crafted grid worlds (flat floors, steps, ledges, lava strips,
-sealed rooms) and assert on the *kind* of move chosen — that stairs are walked not
-jumped, that a dry detour beats crossing lava, that a bot starting on lava escapes
-before chasing the goal, and that unreachable goals yield a sensible partial path.
-
-## Optional extensions
-
-1. **Enable item teleport moves.** AOTV / Etherwarp need a line-of-sight raycast,
-   range and mana checks (a new `MoveContext` field), and executor dispatch on
-   `PathNode::reached_by`. The `Move` trait plumbing is already in place.
-2. **Grow the place graph** with intra-island `Walk`/`TeleportPad` edges and zone
-   anchors as areas get mapped.
-
 ## License
 
-MIT © 2026 Raymond Shell
+Licensed under the [MIT License](LICENSE).

@@ -12,48 +12,25 @@ use azalea::world::World;
 pub enum BlockKind {
     Air,
     Solid,
-    /// A fence, wall, or fence gate: rendered thin but 1.5 blocks TALL, so —
-    /// unlike a normal solid — the bot can neither pass through it NOR step/jump
-    /// onto it (you can't climb or hop a fence in Minecraft). Not occupiable and
-    /// deliberately NOT a valid floor (only `Solid`/`Lava` support a stand in
-    /// [`WorldView::standable`]), so the planner routes AROUND a fence post
-    /// instead of up-and-over it — the over-the-post route it can't execute,
-    /// which had it bump the post, jump, get set back, and oscillate in place.
+    /// A fence, wall, or gate. It blocks movement and cannot be used as a floor.
     Fence,
-    /// A partial block a player walks onto without jumping: bottom slab,
-    /// bottom-half stairs, carpet. The cell itself is enterable (feet
-    /// inside it) and it counts as floor for the cell above.
+    /// A bottom slab, bottom stair, or carpet that can be walked onto.
     Step,
-    /// Lava (source or flowing). Kept structurally occupiable so a bot already
-    /// in it can plan an exit and callers can explicitly select the penalized
-    /// legacy policy. The default planner forbids entering its safety buffer.
+    /// Lava. It remains occupiable so a trapped bot can plan an exit.
     Lava,
-    /// Chunk not loaded — treated as impassable so paths never leave the
-    /// known world. Long-distance travel is the router's job.
+    /// Missing chunk data, treated as impassable.
     Unloaded,
 }
 
-/// What the local planner needs to know about the world. The live azalea
-/// world implements this; tests implement it over a hand-built grid.
+/// The block data needed by the local planner.
 pub trait WorldView {
     fn block(&self, pos: BlockPos) -> BlockKind;
 
-    /// Can the bot stand with its feet at `pos`? Either normally (clear
-    /// cell over a solid or step floor) or inside a step cell (standing
-    /// on the slab/stair, which raises the body half a block, so the
-    /// two cells above must be clear). Lava remains occupiable here so an
-    /// already-trapped bot can generate outward moves; the central planner's
-    /// lava policy decides which of those transitions are legal.
+    /// Returns whether the bot can stand with its feet at `pos`.
+    /// Lava is occupiable here; the movement policy decides whether entry is safe.
     fn standable(&self, pos: BlockPos) -> bool {
-        // where the body can be: air, or wading in lava
         let occupiable = |k: BlockKind| matches!(k, BlockKind::Air | BlockKind::Lava);
-        // what can hold the body up for a *full-height* stand: solids or the
-        // lava surface. A step (bottom slab/stair/carpet) is deliberately NOT
-        // supportive here: standing on a step raises the body only half a
-        // block and is modeled by the `Step` arm below. Treating the air cell
-        // above a step as standable created a phantom foothold that let
-        // JumpMove climb stairs as ordinary full blocks instead of walking
-        // them (auto-step), producing wrong paths and a robotic hop-per-stair.
+        // Steps are separate because they raise the body half a block.
         let supportive = |k: BlockKind| matches!(k, BlockKind::Solid | BlockKind::Lava);
         match self.block(pos) {
             BlockKind::Air | BlockKind::Lava => {
@@ -73,9 +50,7 @@ pub fn offset(p: BlockPos, dx: i32, dy: i32, dz: i32) -> BlockPos {
     BlockPos::new(p.x + dx, p.y + dy, p.z + dz)
 }
 
-/// Classify a block state. Slabs/stairs/carpet are recognized by their
-/// block-kind name plus orientation properties: only bottom variants are
-/// steps; top and double variants act like full blocks.
+/// Reduces a Minecraft block state to the geometry used by the planner.
 pub fn classify_state(state: BlockState) -> BlockKind {
     if state.is_air() {
         return BlockKind::Air;
@@ -99,18 +74,11 @@ pub fn classify_state(state: BlockState) -> BlockKind {
     if name.ends_with("Carpet") {
         return BlockKind::Step;
     }
-    // Fences, cobblestone/etc. walls, and fence gates are 1.5 blocks tall — you
-    // can't hop them or stand on top by stepping up from the side. Classifying
-    // them as their own kind (NOT Solid) stops the planner routing up-and-over a
-    // fence post (a route the bot can't execute → bump/jump/setback oscillation);
-    // it routes around instead. ("*Wall" only matches real wall blocks; wall-
-    // mounted decorations end with their own noun — Torch/Sign/Banner/Skull.)
+    // These are taller than a full block and cannot be climbed from the side.
     if name.ends_with("Fence") || name.ends_with("FenceGate") || name.ends_with("Wall") {
         return BlockKind::Fence;
     }
-    // Water is left as Solid (impassable) for now — swimming isn't modeled.
-    // Other thin blocks (panes, bars) read as Solid, which is safe: they're one
-    // block tall, so the planner simply won't path through them.
+    // Swimming and thin-block geometry are not modeled yet.
     BlockKind::Solid
 }
 
@@ -123,28 +91,12 @@ impl WorldView for World {
     }
 }
 
-/// An OWNED copy of a bounded world region — no lock, no lifetime.
+/// An owned copy of a bounded world region.
 ///
-/// Why this exists: A* over a live world view takes the world `RwLock` read
-/// lock once per block query, in a tight loop, for up to the
-/// whole search budget. parking_lot's RwLock lets that continuous read
-/// pressure starve azalea's tick, which needs `world.write()` every tick for
-/// chunk/entity updates — so a long search froze the entire client (all loops
-/// stalled at once; the stall watchdog's "tick broadcaster froze" signature).
-/// Wrapping the search in a `timeout` did NOT help: `spawn_blocking` can't be
-/// cancelled, so the abandoned search kept holding the lock.
-///
-/// [`capture`](Self::capture) copies a cube around the start under ONE brief
-/// read lock (block-state lookup is a cheap array index; classification is
-/// memoized), then the search runs over this owned map holding NO lock — so it
-/// can never starve the tick, however long it runs. Cells outside the captured
-/// cube (or genuinely unloaded) read as [`BlockKind::Unloaded`], exactly as
-/// before, so the incremental-leg re-planning in `walk_to` still walks toward
-/// far goals and re-captures from the new position.
+/// Planning against a snapshot avoids holding the world lock during A*. Cells
+/// outside the captured area are [`BlockKind::Unloaded`].
 pub struct WorldSnapshot {
-    /// Dense X/Z/Y array over `lo..=hi`. A bounded planning snapshot can exceed
-    /// a million cells; one compact enum per cell is dramatically cheaper than
-    /// a hash-map allocation per block and gives constant-time indexed reads.
+    /// Dense X/Z/Y storage over `lo..=hi`.
     blocks: Vec<BlockKind>,
     lo: BlockPos,
     hi: BlockPos,
@@ -153,12 +105,7 @@ pub struct WorldSnapshot {
 }
 
 impl WorldSnapshot {
-    /// Copy the inclusive AABB `lo..=hi` under one brief read lock. The caller
-    /// sizes the box to CONTAIN the goal (plus margin) — a fixed cube around
-    /// the start hid any goal or corridor beyond its radius, so the search
-    /// couldn't see a straight path and detoured (over lava). Every cell is
-    /// classified once into a compact dense array; missing chunk data remains
-    /// `Unloaded` (impassable).
+    /// Copies the inclusive area `lo..=hi` under one world read lock.
     pub fn capture(world: &parking_lot::RwLock<World>, lo: BlockPos, hi: BlockPos) -> Self {
         let inclusive_len = |low: i32, high: i32| -> usize {
             (i64::from(high) - i64::from(low) + 1).max(0) as usize

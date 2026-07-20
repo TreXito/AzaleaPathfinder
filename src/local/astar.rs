@@ -64,28 +64,16 @@ struct NodeData {
     reached_by: MoveKind,
 }
 
-/// Admissible A* heuristic: octile horizontal distance combined via `max()`
-/// with a vertical floor. Uses `max()` (not `+`) because one move can reduce
-/// horizontal AND vertical distance at once (a step-up is +1 across and +1 up),
-/// so summing separate bounds double-counts and overestimates — that was the
-/// old `+ 10*dy` inadmissibility. Ascending costs ≥10 per level (≥1 up-move
-/// each); descending costs ≥10 per `max_fall` blocks (≥1 fall each). The true
-/// path cost is ≥ both terms, so `max()` is a valid lower bound — and unlike a
-/// pure-horizontal heuristic it pulls the search toward the goal's altitude
-/// instead of treating every y as equal (the "ignores the y-level" bug).
+/// Lower bound for A*: octile horizontal cost and vertical cost are combined
+/// with `max` because one move can advance on both axes.
 fn heuristic(pos: BlockPos, goal: BlockPos, ctx: &MoveContext) -> Cost {
-    // The planner accepts any node inside the Manhattan goal tolerance. Apply
-    // that tolerance independently to each axis; this is deliberately more
-    // generous than the shared Manhattan allowance, so it remains a safe
-    // lower bound for the cheapest acceptable endpoint.
+    // Applying tolerance to each axis is looser than Manhattan tolerance, so
+    // the estimate stays admissible.
     let tolerance = ctx.goal_tolerance.max(0) as u32;
     let dx = pos.x.abs_diff(goal.x).saturating_sub(tolerance);
     let dz = pos.z.abs_diff(goal.z).saturating_sub(tolerance);
     let dy = pos.y.abs_diff(goal.y).saturating_sub(tolerance);
-    // Jump, step, and fall moves also advance one horizontal block. Custom
-    // tuning may make one of them cheaper than a plain walk, so using only the
-    // walking price would overestimate and could make A* return a suboptimal
-    // route. This is the cheapest horizontal progress in the built-in set.
+    // Jump, step, and fall can also make horizontal progress.
     let cardinal = ctx
         .costs
         .cardinal_walk
@@ -107,13 +95,8 @@ fn heuristic(pos: BlockPos, goal: BlockPos, ctx: &MoveContext) -> Cost {
     horiz.max(vert)
 }
 
-/// A* over block positions using the supplied move set. Succeeds when a
-/// node within `ctx.goal_tolerance` (manhattan) of `goal` is expanded.
-///
-/// This strict "fail if unreachable" variant is the reference planner and
-/// the move-rule test bed; the live executor uses [`find_path_best_effort`]
-/// so it can chase goals whose chunks aren't loaded yet. Kept (rather than
-/// deleted) because these tests are the movement-rule coverage.
+/// Finds a path to within `ctx.goal_tolerance` Manhattan distance of `goal`.
+/// Returns an error instead of a partial path when the goal cannot be reached.
 #[allow(dead_code)]
 pub fn find_path(
     world: &dyn WorldView,
@@ -122,9 +105,6 @@ pub fn find_path(
     moves: &[Box<dyn Move>],
     ctx: &MoveContext,
 ) -> Result<Path, PathError> {
-    // Admissible heuristic with vertical guidance (see `heuristic`). Wall/lava
-    // penalties only ever add cost, so this stays a valid lower bound and A*
-    // stays optimal.
     let use_heuristic = moves
         .iter()
         .all(|movement| movement.supports_builtin_heuristic());
@@ -144,7 +124,7 @@ pub fn find_path(
     let key = |p: BlockPos| -> Key { (p.x, p.y, p.z) };
 
     let mut nodes: HashMap<Key, NodeData> = HashMap::new();
-    // (f-score, position) — Reverse turns std's max-heap into a min-heap
+    // Reverse turns the max-heap into a min-heap ordered by f-score.
     let mut open: BinaryHeap<Reverse<(Cost, Cost, Key)>> = BinaryHeap::new();
 
     nodes.insert(
@@ -183,7 +163,7 @@ pub fn find_path(
         if expansions > ctx.max_expansions {
             return Err(PathError::SearchBudgetExhausted);
         }
-        // wall-clock bound, checked sparsely to keep overhead negligible
+        // Check time occasionally to avoid paying for a clock read per node.
         if expansions.is_multiple_of(512) && std::time::Instant::now() > deadline {
             return Err(PathError::SearchBudgetExhausted);
         }
@@ -198,8 +178,7 @@ pub fn find_path(
             }
             let ek = key(edge.to);
             let base_g = g.saturating_add(edge.cost);
-            // Terrain penalties are non-negative. If the unpenalized route is
-            // already no better, avoid the expensive neighbourhood scans.
+            // Skip the terrain scan if the base cost cannot improve this node.
             if nodes.get(&ek).is_some_and(|nd| base_g >= nd.g) {
                 continue;
             }
@@ -229,14 +208,9 @@ pub fn find_path(
     Err(PathError::NoPath)
 }
 
-/// Like [`find_path`], but never fails outright: when it can't reach the goal
-/// (open set exhausted, or budget hit) it returns the best partial path — to
-/// the reachable node closest to the goal — with `reached = false`. Walking
-/// that partial path loads new chunks, so a caller that re-plans from the new
-/// position can chase a goal whose chunks weren't loaded yet (viable patrol
-/// waypoints beyond the initially-loaded area). `reached = true` means the
-/// returned path actually reaches the goal. The path always starts at `start`;
-/// if no progress is possible it's a single-node path (`nodes.len() == 1`).
+/// Finds a complete path when possible, or the best reachable partial path.
+/// The boolean is `true` only when the goal was reached. The path always starts
+/// at `start`; if no progress is possible, it contains only that node.
 pub fn find_path_best_effort(
     world: &dyn WorldView,
     start: BlockPos,
@@ -279,9 +253,7 @@ pub fn find_path_best_effort(
     )));
 
     let mut lava_risks: HashMap<Key, Cost> = HashMap::new();
-    // Closest-to-goal node reached so far, for the partial fallback. If the
-    // start is unsafe, lower lava exposure ranks ahead of goal distance so a
-    // partial plan leads out instead of returning the hazardous start node.
+    // When starting near lava, escaping it takes priority over goal distance.
     let mut best_risk = cached_lava_risk(start, world, ctx, &mut lava_risks);
     let mut best_dist = manhattan(start);
     let mut best = (start, 0u32);
@@ -350,8 +322,7 @@ pub fn find_path_best_effort(
         }
     }
 
-    // couldn't reach the goal — hand back the closest reachable node so the
-    // caller can walk toward the goal (loading chunks) and try again
+    // A partial path lets the caller move, load more chunks, and plan again.
     (reconstruct(&nodes, best.0, best.1), false)
 }
 
@@ -379,7 +350,6 @@ fn tie_break(pos: BlockPos, seed: u64) -> Cost {
         ^ (pos.z as u64).wrapping_mul(0xC2B2AE3D27D4EB4F)
         ^ (pos.y as u64);
 
-    // cheap xorshift
     x ^= x << 13;
     x ^= x >> 7;
     x ^= x << 17;
@@ -395,7 +365,7 @@ mod tests {
     use super::super::world::BlockKind;
     use super::*;
 
-    /// Hand-built grid world: solid, step, and lava blocks, else air.
+    /// Small test world where unspecified blocks are air.
     struct Grid {
         solid: HashSet<(i32, i32, i32)>,
         steps: HashSet<(i32, i32, i32)>,
@@ -411,8 +381,7 @@ mod tests {
             }
         }
 
-        /// Solid floor at height `y` covering the given ranges; the bot
-        /// stands at `y + 1`.
+        /// Adds a solid floor; the player stands one block above it.
         fn floor(
             &mut self,
             xs: std::ops::RangeInclusive<i32>,
@@ -449,18 +418,14 @@ mod tests {
     #[test]
     fn tie_break_is_deterministic_bounded_and_seed_dependent() {
         let p = BlockPos::new(3, 64, -7);
-        // deterministic for a given (pos, seed)
         assert_eq!(tie_break(p, 42), tie_break(p, 42));
-        // a SMALL secondary key: it orders equal-f-score nodes only, and must
-        // never grow large enough to override the f-score itself (which would
-        // sacrifice path optimality, not just vary the route).
+        // Keep this too small to override the primary f-score.
         for s in 0..64 {
             assert!(
                 tie_break(p, s) < 3,
                 "tie-break must stay a small ordering key"
             );
         }
-        // the seed actually reorders positions — otherwise the path never varies
         assert!(
             (0..32).any(|s| tie_break(p, s) != tie_break(p, s + 1)),
             "the seed must vary the tie-break"
@@ -475,9 +440,7 @@ mod tests {
     fn heuristic_accounts_for_vertical_distance() {
         let goal = BlockPos::new(0, 0, 0);
         let ctx = ctx();
-        // A purely-vertical offset must produce a non-zero estimate — the old
-        // horizontal-only heuristic returned 0 here, so the search treated
-        // "directly above/below the goal" as "already there" and ignored y.
+        // Vertical distance must contribute to the estimate.
         assert!(
             heuristic(BlockPos::new(0, 8, 0), goal, &ctx) > 0,
             "goal below ignored"
@@ -486,12 +449,10 @@ mod tests {
             heuristic(BlockPos::new(0, -8, 0), goal, &ctx) > 0,
             "goal above ignored"
         );
-        // Horizontal-dominant cases keep the octile value (vertical term folds
-        // in via max(), never adds on top — so it can't overestimate).
+        // Vertical cost folds in with max, so it does not inflate this bound.
         assert_eq!(heuristic(BlockPos::new(10, 0, 0), goal, &ctx), 90);
         assert_eq!(heuristic(BlockPos::new(10, 2, 0), goal, &ctx), 90);
-        // A one-level descent can be a cheap stair step, so the fall-based
-        // bound must never overestimate it.
+        // A one-level descent may be a cheap stair step.
         assert_eq!(heuristic(BlockPos::new(0, 1, 0), goal, &ctx), 0);
     }
 
@@ -505,8 +466,6 @@ mod tests {
         ctx.costs.fall_base = 1;
         ctx.costs.fall_per_block = 1;
 
-        // Built-in jump/fall moves advance horizontally, so their configured
-        // cost is also a lower bound for horizontal progress.
         assert_eq!(
             heuristic(BlockPos::new(0, 64, 0), BlockPos::new(3, 64, 0), &ctx),
             4
@@ -670,13 +629,13 @@ mod tests {
     fn keeps_clearance_from_walls() {
         let mut grid = Grid::new();
         grid.floor(0..=8, 1..=4, 63); // stand at y=64
-        // a wall along z=0, two blocks tall
+        // Two-block wall along z=0.
         for x in 0..=8 {
             grid.solid.insert((x, 64, 0));
             grid.solid.insert((x, 65, 0));
         }
 
-        // start and goal hug the wall; a human drifts a block away
+        // The preferred path should leave some space from the wall.
         let path = find_path(
             &grid,
             BlockPos::new(0, 64, 1),
@@ -694,7 +653,6 @@ mod tests {
         );
     }
 
-    /// Feet-cell has lava directly beneath it.
     fn on_lava(grid: &Grid, p: BlockPos) -> bool {
         grid.lava.contains(&(p.x, p.y - 1, p.z))
     }
@@ -703,8 +661,7 @@ mod tests {
     fn avoids_lava_when_a_dry_route_exists() {
         let mut grid = Grid::new();
         grid.floor(-1..=7, -1..=5, 63); // stand at y=64
-        // A lava strip blocks the direct lane, but a route outside the default
-        // two-block safety buffer remains available at z=4..5.
+        // A safe detour remains outside the two-block lava buffer.
         for z in -1..=1 {
             grid.solid.remove(&(3, 63, z));
             grid.lava.insert((3, 63, z));
@@ -731,8 +688,7 @@ mod tests {
     #[test]
     fn refuses_lava_even_when_it_is_the_only_route() {
         let mut grid = Grid::new();
-        // 1-wide corridor along z=0; the only floor cell at x=3 is lava, so
-        // reaching the far side means stepping over it
+        // The only route through this one-block corridor crosses lava.
         grid.floor(-1..=7, 0..=0, 63);
         grid.solid.remove(&(3, 63, 0));
         grid.lava.insert((3, 63, 0));
@@ -773,9 +729,7 @@ mod tests {
     #[test]
     fn best_effort_prioritizes_escaping_an_existing_lava_hazard() {
         let mut grid = Grid::new();
-        // The only exit is east, while the unreachable goal is west. A
-        // distance-only partial fallback would remain on lava because every
-        // safe step initially moves farther from the goal.
+        // Escaping east initially moves away from the unreachable western goal.
         grid.floor(0..=4, 0..=0, 63);
         grid.solid.remove(&(0, 63, 0));
         grid.lava.insert((0, 63, 0));
@@ -809,7 +763,7 @@ mod tests {
     fn no_path_out_of_a_sealed_box() {
         let mut grid = Grid::new();
         grid.floor(-2..=2, -2..=2, 63);
-        // seal a 5x5 room: walls all around, lid on top
+        // Seal the room with walls and a roof.
         for y in 64..=67 {
             for x in -2..=2 {
                 grid.solid.insert((x, y, -2));
@@ -854,8 +808,7 @@ mod tests {
 
     #[test]
     fn best_effort_returns_partial_toward_unreachable_goal() {
-        // floor only reaches x=4; the goal at x=20 sits past the known world
-        // (like an unloaded chunk). Best-effort should walk toward it, not fail.
+        // The floor ends before the goal, like an unloaded chunk boundary.
         let mut grid = Grid::new();
         grid.floor(-2..=4, -2..=2, 63);
 
@@ -865,7 +818,6 @@ mod tests {
 
         assert!(!reached, "goal is past the floor; can't be reached yet");
         assert!(path.nodes.len() >= 2, "should still step toward the goal");
-        // the partial path must end closer to the goal than the start
         let end = path.nodes.last().unwrap().pos;
         assert!(
             dist(end, goal) < dist(start, goal),

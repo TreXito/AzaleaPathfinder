@@ -1,4 +1,4 @@
-//! Azalea plugin and client-facing navigation API.
+//! Azalea plugin and navigation API.
 
 use std::future::Future;
 
@@ -22,8 +22,7 @@ use crate::{
 
 #[derive(Debug, Clone, Resource)]
 pub struct PathfinderSettings {
-    /// Periodic refresh for dynamic goals, even if the publisher did not bump
-    /// its revision. A value of zero disables periodic refresh.
+    /// Ticks between fallback replans for dynamic goals. Set to 0 to disable.
     pub dynamic_replan_ticks: u32,
     pub max_plan_legs: u32,
     pub snapshot_margin: i32,
@@ -36,9 +35,6 @@ pub struct PathfinderSettings {
 impl Default for PathfinderSettings {
     fn default() -> Self {
         Self {
-            // Dynamic publishers already trigger an immediate replan by
-            // changing position/revision. Periodic same-goal replanning is an
-            // opt-in fallback because it pauses movement while planning.
             dynamic_replan_ticks: 0,
             max_plan_legs: 16,
             snapshot_margin: 10,
@@ -64,16 +60,16 @@ impl NavigationGoal {
     }
 }
 
-/// Insert this component on a local-player entity to start or replace a route.
+/// Add this to a local player to start or replace navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Component)]
 pub struct NavigationRequest {
     pub goal: NavigationGoal,
     pub path_seed: u64,
-    /// Monotonic caller token. Results from older generations are discarded.
+    /// Increase for each request; older results are ignored.
     pub generation: u64,
 }
 
-/// Application-owned pause switch. Paused time never consumes the stall budget.
+/// Pauses navigation without using the stall budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Component, Default)]
 pub struct NavigationPaused(pub bool);
 
@@ -119,8 +115,7 @@ struct PlanResult {
     legs: u32,
 }
 
-/// Complete block-navigation plugin: it plans off-thread, follows paths on the
-/// game tick, replans partial/dynamic routes, and publishes status components.
+/// Plans and follows block paths for local players.
 pub struct AzaleaPathfinderPlugin;
 
 impl Plugin for AzaleaPathfinderPlugin {
@@ -175,8 +170,7 @@ fn start_requested_navigation(
                 .entity(entity)
                 .remove::<(ActiveNavigation, NavigationTask, NavigationTerminal)>();
         }
-        // A replaced request must not inherit the previous follower's forward
-        // input while its new plan is being computed.
+        // Stop old movement while the replacement path is planned.
         stop(entity, &mut walk_events);
         let task = spawn_plan(
             *request,
@@ -300,9 +294,7 @@ fn tick_navigation(
             continue;
         }
 
-        // Execution safety must use current blocks, not the potentially stale
-        // snapshot captured when A* ran. This small LOS snapshot is bounded by
-        // max_los_skip and the lava clearance margin.
+        // Check nearby blocks again before following the planned path.
         let (low, high) = follower_snapshot_bounds(
             **position,
             active.follower.path(),

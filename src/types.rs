@@ -2,16 +2,10 @@ use std::fmt;
 
 use azalea::BlockPos;
 
-/// Integer path cost in tenths of a block (walking one block costs 10).
-/// Integers keep A* ordering exact and `Ord`-friendly.
+/// Path cost in tenths of a block. Walking one block costs 10.
 pub type Cost = u32;
 
-/// How a node in a path is reached from its predecessor.
-///
-/// `Aotv`/`Etherwarp` pair with the inert teleport moves (see
-/// `local::teleport`); they're produced once those moves are implemented and
-/// are asserted on in tests, so allow(dead_code) until the executor dispatches
-/// on them.
+/// Movement used to reach a path node.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MoveKind {
@@ -26,8 +20,7 @@ pub enum MoveKind {
 #[derive(Debug, Clone, Copy)]
 pub struct PathNode {
     pub pos: BlockPos,
-    /// How this node was reached. Read by tests today and by the executor once
-    /// it dispatches teleport moves (`local::teleport`); see that module's docs.
+    /// Movement used to reach this node.
     #[allow(dead_code)]
     pub reached_by: MoveKind,
 }
@@ -41,13 +34,13 @@ pub struct Path {
 
 #[derive(Debug)]
 pub enum PathError {
-    /// The search exhausted every reachable node without touching the goal.
+    /// No route reaches the goal.
     NoPath,
-    /// The search hit its expansion budget before reaching the goal.
+    /// The search hit its expansion limit.
     SearchBudgetExhausted,
-    /// The bot stopped making progress while following a path.
+    /// The follower stopped making progress.
     Stuck { at: BlockPos },
-    /// A newer request or caller cancellation superseded this path.
+    /// The request was replaced or cancelled.
     Cancelled,
 }
 

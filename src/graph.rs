@@ -2,36 +2,26 @@ use azalea::BlockPos;
 
 use super::types::Cost;
 
-/// A named location the router can plan between: an island, or a zone
-/// within one. Islands are recognized by the locraw `mode` field the bot
-/// already parses; zones are anchored to coordinates on the same island.
+/// A named island or zone in the travel graph.
 #[derive(Debug, Clone)]
 pub struct Place {
-    /// Stable id used by `Destination::Place` and console commands.
+    /// Stable identifier used to look up this place.
     pub id: &'static str,
-    /// locraw `mode` that identifies this place, if it is a whole island.
+    /// Locraw mode, or `None` for a zone.
     pub mode: Option<&'static str>,
-    /// Representative coordinates, used as a walking target for `Walk`
-    /// edges and zone destinations. `None` for warp-only islands.
+    /// Walking target, or `None` for a warp-only place.
     pub anchor: Option<BlockPos>,
 }
 
-/// How to traverse from one place to another.
-///
-/// `TeleportPad`/`Walk` are extension points: the starter graph is warp-only,
-/// and intra-island `Walk`/`TeleportPad` edges get added as data (with zone
-/// anchors) as islands are mapped. `execute_route` already handles them, so
-/// they're not yet constructed by `skyblock_default` — hence allow(dead_code).
+/// How to travel between two places.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum TravelEdge {
-    /// Run `/warp <name>`. `Player::warp_to` just sends the command; the
-    /// executor confirms the landing island via locraw afterwards.
+    /// Run `/warp <name>`.
     Warp { name: &'static str },
     /// Walk onto a teleport pad at this position.
     TeleportPad { pad: BlockPos },
-    /// Plain walking between two places on the same island (target is the
-    /// destination place's `anchor`).
+    /// Walk to the destination place's anchor.
     Walk,
 }
 
@@ -43,23 +33,18 @@ pub struct GraphEdge {
     pub cost: Cost,
 }
 
-/// The high-level Skyblock travel graph. Extending coverage means adding
-/// data here (places, warps, pads, zone anchors) — never new code paths.
+/// A graph of named places and travel links.
 #[derive(Debug, Clone)]
 pub struct WorldGraph {
     pub places: Vec<Place>,
     pub edges: Vec<GraphEdge>,
 }
 
-/// Rough cost of a warp in the same tenth-of-a-block units the local
-/// planner uses: high enough that short walks win, low enough that warps
-/// always beat cross-island walking (which is impossible anyway).
+/// Priced so short walks beat warps.
 const WARP_COST: Cost = 200;
 
 impl WorldGraph {
-    /// Starter graph: Hub, Deep Caverns (`mining_2`), Dwarven Mines
-    /// (`mining_3`), fully connected by warps. Zones within islands are
-    /// added as `Walk`/`TeleportPad` edges with anchors as they get mapped.
+    /// Hub, Deep Caverns, and Dwarven Mines, connected by warps.
     pub fn skyblock_default() -> Self {
         let places = vec![
             Place {

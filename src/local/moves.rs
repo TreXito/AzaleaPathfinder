@@ -3,14 +3,13 @@ use azalea::BlockPos;
 use super::world::{BlockKind, WorldView, offset};
 use crate::types::{Cost, MoveKind};
 
-/// Whether a planner may enter lava danger. SkyBlock bots cannot reliably swim
-/// out, so the default is a hard exclusion rather than a finite cost.
+/// Controls whether the planner may enter lava or its safety buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LavaPolicy {
     /// Never enter the clearance buffer. If the start is already unsafe, only
     /// transitions that strictly reduce lava exposure are permitted.
     Forbidden { clearance: i32 },
-    /// Legacy/emergency behavior: lava remains traversable at a very high cost.
+    /// Allow lava, with the configured penalties added to the route.
     Penalized,
 }
 
@@ -20,8 +19,7 @@ impl Default for LavaPolicy {
     }
 }
 
-/// Costs in tenths of a flat block. These defaults price risky SkyBlock
-/// movement more realistically than geometric distance alone.
+/// Movement costs in tenths of a flat block.
 #[derive(Debug, Clone, Copy)]
 pub struct MovementCosts {
     pub cardinal_walk: Cost,
@@ -52,19 +50,13 @@ pub struct MoveContext {
     pub max_fall: i32,
     /// Manhattan distance at which the goal counts as reached.
     pub goal_tolerance: i32,
-    /// Node-expansion budget before the search gives up. Deep Caverns
-    /// navigation is genuinely 3D, so this remains generous even with the
-    /// planner's vertical heuristic. Build in release mode for live use.
+    /// Maximum nodes expanded during one search.
     pub max_expansions: usize,
-    /// Wall-clock budget for one search, in ms. Bounds the worst case — an
-    /// unreachable goal otherwise explores the entire loaded cave system
-    /// before concluding "no path", which can take seconds in debug builds.
+    /// Wall-clock limit for one search, in milliseconds.
     pub time_budget_ms: u64,
-    /// Base movement costs calibrated for conservative SkyBlock movement.
+    /// Base cost for each movement type.
     pub costs: MovementCosts,
-    /// Extra cost per adjacent wall when standing at a node. Real players
-    /// leave clearance unless squeezing actually saves distance; 0 turns
-    /// the behavior off. (Walking one block costs 10 for scale.)
+    /// Extra cost per adjacent wall. Set to zero to disable wall clearance.
     pub wall_penalty: Cost,
     /// Whether lava and its clearance buffer are forbidden or merely costly.
     pub lava_policy: LavaPolicy,
@@ -72,9 +64,10 @@ pub struct MoveContext {
     pub lava_penalty: Cost,
     /// Radius for the soft avoidance cost beyond the hard clearance buffer.
     pub lava_proximity_radius: i32,
-    /// Distance-weighted avoidance beyond the hard clearance buffer.
+    /// Cost multiplier for nearby lava outside the hard buffer.
     pub lava_proximity_penalty: Cost,
 
+    /// Seed used to vary ties between equal-cost paths.
     pub path_seed: u64,
 }
 
@@ -103,9 +96,7 @@ pub struct Edge {
     pub cost: Cost,
 }
 
-/// A movement capability the planner can use. Adding a new way of getting
-/// around (parkour jumps, AOTV, etherwarp, ...) means implementing this
-/// trait — the A* core never changes.
+/// A movement rule used by the planner.
 pub trait Move: Send + Sync {
     /// Push every position reachable from `from` in one application of
     /// this move onto `out`.
@@ -117,17 +108,14 @@ pub trait Move: Send + Sync {
         out: &mut Vec<Edge>,
     );
 
-    /// Whether every edge produced by this rule obeys the one-block movement
-    /// limits assumed by the built-in A* heuristic. The conservative default
-    /// keeps custom long-range or unusually cheap moves optimal by falling
-    /// back to Dijkstra search.
+    /// Whether this rule satisfies the built-in heuristic's distance and cost
+    /// assumptions. Return `false` for long-range or unusually cheap moves.
     fn supports_builtin_heuristic(&self) -> bool {
         false
     }
 }
 
-/// The standard legit move set: walk, jump up one, fall off ledges, plus
-/// the (currently inert) item-teleport extension points.
+/// Standard walking, jumping, falling, and teleport extension points.
 pub fn default_moves() -> Vec<Box<dyn Move>> {
     vec![
         Box::new(WalkMove),
@@ -141,9 +129,7 @@ pub fn default_moves() -> Vec<Box<dyn Move>> {
 const CARDINALS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
 const DIAGONALS: [(i32, i32); 4] = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
 
-/// Extra cost for standing beside walls (feet or head level), so paths
-/// drift toward open space like a player's would. Symmetric situations
-/// (1-wide tunnels) penalize every option equally and stay unaffected.
+/// Adds a cost for each adjacent wall at feet or head height.
 pub fn wall_proximity_penalty(pos: BlockPos, world: &dyn WorldView, per_wall: Cost) -> Cost {
     if per_wall == 0 {
         return 0;
@@ -160,9 +146,7 @@ pub fn wall_proximity_penalty(pos: BlockPos, world: &dyn WorldView, per_wall: Co
     penalty
 }
 
-/// Cost added for standing at a node that touches lava — feet or head in
-/// it, or standing on its surface. Flat (not per-contact) so it's a clean
-/// "was any lava involved in this step" toll that makes lava a last resort.
+/// Adds a flat cost when the player's feet, head, or floor touches lava.
 pub fn lava_penalty(pos: BlockPos, world: &dyn WorldView, per: Cost) -> Cost {
     if per == 0 {
         return 0;
@@ -173,8 +157,7 @@ pub fn lava_penalty(pos: BlockPos, world: &dyn WorldView, per: Cost) -> Cost {
     if touches_lava { per } else { 0 }
 }
 
-/// Exposure score within `clearance`: zero is safe, larger means closer to
-/// lava. The floor/body/head band catches both pools and flowing lava.
+/// Returns lava exposure within `clearance`; zero means safe.
 pub fn lava_risk(pos: BlockPos, world: &dyn WorldView, clearance: i32) -> Cost {
     let clearance = clearance.max(0);
     let mut nearest: Option<i32> = None;
@@ -216,9 +199,7 @@ pub fn lava_proximity_penalty(
         return 0;
     }
 
-    // Charge once for the nearest relevant lava, rather than once per lava
-    // block. Large SkyBlock pools should not multiply a node's cost hundreds
-    // of times, and lava on a separate cave level should not affect this path.
+    // Use the nearest lava so large pools do not multiply the cost.
     for distance in 1..=radius {
         for dx in -distance..=distance {
             for dz in -distance..=distance {
@@ -238,8 +219,7 @@ pub fn lava_proximity_penalty(
     0
 }
 
-/// Step one block on level ground — cardinal, or diagonal when neither
-/// flanking cell clips the player's body (humans cut corners, not blocks).
+/// Walks on level ground, stairs, and slabs. Diagonals require clear corners.
 pub struct WalkMove;
 
 impl Move for WalkMove {
@@ -269,7 +249,6 @@ impl Move for WalkMove {
                 && body_clear(offset(from, dx, 0, 0))
                 && body_clear(offset(from, 0, 0, dz))
             {
-                // ~10 * sqrt(2)
                 out.push(Edge {
                     to,
                     kind: MoveKind::Walk,
@@ -277,11 +256,8 @@ impl Move for WalkMove {
                 });
             }
         }
-        // stairs and slabs: half-block rises/drops are WALKED (physics
-        // auto-step), never jumped. Ascending is only a walk when we're
-        // already standing inside a step cell (elevated half a block);
-        // reaching a step from flat ground is a same-y move, and a step
-        // sitting a full block up still needs the jump move.
+        // Auto-step handles stairs and slabs. A full-block rise still uses
+        // JumpMove unless the player is already standing on a raised step.
         let from_step = world.block(from) == BlockKind::Step;
         for (dx, dz) in CARDINALS {
             for dy in [1, -1] {
@@ -325,7 +301,6 @@ impl Move for JumpMove {
         ctx: &MoveContext,
         out: &mut Vec<Edge>,
     ) {
-        // headroom above the current position to jump at all
         if world.block(offset(from, 0, 2, 0)) != BlockKind::Air {
             return;
         }
@@ -360,15 +335,13 @@ impl Move for FallMove {
     ) {
         for (dx, dz) in CARDINALS {
             let step = offset(from, dx, 0, dz);
-            // need clearance to walk into the gap, and it must be a gap
             if world.block(step) != BlockKind::Air
                 || world.block(offset(step, 0, 1, 0)) != BlockKind::Air
                 || world.standable(step)
             {
                 continue;
             }
-            // scan straight down for a landing spot (solid floor or a
-            // slab/stair cell both count as landing)
+            // Stop at the first valid landing or obstruction.
             for drop in 1..=ctx.max_fall {
                 let feet = offset(step, 0, -drop, 0);
                 if world.standable(feet) {

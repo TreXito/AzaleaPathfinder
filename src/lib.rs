@@ -1,7 +1,4 @@
-//! Reusable path planning for Azalea clients.
-//!
-//! The first extraction phase intentionally contains no hunting, combat, farm,
-//! or `Player` state. Callers choose a goal; this crate plans how to reach it.
+//! Path planning and navigation for Azalea clients.
 
 pub mod graph;
 pub mod local;
