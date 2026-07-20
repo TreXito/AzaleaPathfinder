@@ -160,9 +160,12 @@ impl WorldSnapshot {
     /// classified once into a compact dense array; missing chunk data remains
     /// `Unloaded` (impassable).
     pub fn capture(world: &parking_lot::RwLock<World>, lo: BlockPos, hi: BlockPos) -> Self {
-        let size_x = (hi.x - lo.x + 1).max(0) as usize;
-        let size_y = (hi.y - lo.y + 1).max(0) as usize;
-        let size_z = (hi.z - lo.z + 1).max(0) as usize;
+        let inclusive_len = |low: i32, high: i32| -> usize {
+            (i64::from(high) - i64::from(low) + 1).max(0) as usize
+        };
+        let size_x = inclusive_len(lo.x, hi.x);
+        let size_y = inclusive_len(lo.y, hi.y);
+        let size_z = inclusive_len(lo.z, hi.z);
         let mut blocks = Vec::with_capacity(size_x.saturating_mul(size_y).saturating_mul(size_z));
         let mut memo: HashMap<u32, BlockKind> = HashMap::new();
         let guard = world.read();

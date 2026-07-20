@@ -74,27 +74,34 @@ struct NodeData {
 /// pure-horizontal heuristic it pulls the search toward the goal's altitude
 /// instead of treating every y as equal (the "ignores the y-level" bug).
 fn heuristic(pos: BlockPos, goal: BlockPos, ctx: &MoveContext) -> Cost {
-    let dx = (pos.x - goal.x).unsigned_abs();
-    let dz = (pos.z - goal.z).unsigned_abs();
-    let diagonal = ctx
+    // The planner accepts any node inside the Manhattan goal tolerance. Apply
+    // that tolerance independently to each axis; this is deliberately more
+    // generous than the shared Manhattan allowance, so it remains a safe
+    // lower bound for the cheapest acceptable endpoint.
+    let tolerance = ctx.goal_tolerance.max(0) as u32;
+    let dx = pos.x.abs_diff(goal.x).saturating_sub(tolerance);
+    let dz = pos.z.abs_diff(goal.z).saturating_sub(tolerance);
+    let dy = pos.y.abs_diff(goal.y).saturating_sub(tolerance);
+    // Jump, step, and fall moves also advance one horizontal block. Custom
+    // tuning may make one of them cheaper than a plain walk, so using only the
+    // walking price would overestimate and could make A* return a suboptimal
+    // route. This is the cheapest horizontal progress in the built-in set.
+    let cardinal = ctx
         .costs
-        .diagonal_walk
-        .min(ctx.costs.cardinal_walk.saturating_mul(2));
-    let horiz = diagonal.saturating_mul(dx.min(dz)).saturating_add(
-        ctx.costs
-            .cardinal_walk
-            .saturating_mul(dx.max(dz) - dx.min(dz)),
-    );
+        .cardinal_walk
+        .min(ctx.costs.step)
+        .min(ctx.costs.jump)
+        .min(ctx.costs.fall_base.saturating_add(ctx.costs.fall_per_block));
+    let diagonal = ctx.costs.diagonal_walk.min(cardinal.saturating_mul(2));
+    let horiz = diagonal
+        .saturating_mul(dx.min(dz))
+        .saturating_add(cardinal.saturating_mul(dx.max(dz) - dx.min(dz)));
     let vert = if pos.y < goal.y {
-        ctx.costs
-            .step
-            .min(ctx.costs.jump)
-            .saturating_mul((goal.y - pos.y) as u32)
+        ctx.costs.step.min(ctx.costs.jump).saturating_mul(dy)
     } else {
-        let down = (pos.y - goal.y) as u32;
         let cheapest_fall = ctx.costs.fall_base.saturating_add(ctx.costs.fall_per_block);
-        let fall_bound = cheapest_fall.saturating_mul(down.div_ceil(ctx.max_fall.max(1) as u32));
-        let stair_bound = ctx.costs.step.saturating_mul(down);
+        let fall_bound = cheapest_fall.saturating_mul(dy.div_ceil(ctx.max_fall.max(1) as u32));
+        let stair_bound = ctx.costs.step.saturating_mul(dy);
         fall_bound.min(stair_bound)
     };
     horiz.max(vert)
@@ -118,9 +125,22 @@ pub fn find_path(
     // Admissible heuristic with vertical guidance (see `heuristic`). Wall/lava
     // penalties only ever add cost, so this stays a valid lower bound and A*
     // stays optimal.
-    let h = |p: BlockPos| -> Cost { heuristic(p, goal, ctx) };
-    let manhattan =
-        |p: BlockPos| -> i32 { (p.x - goal.x).abs() + (p.y - goal.y).abs() + (p.z - goal.z).abs() };
+    let use_heuristic = moves
+        .iter()
+        .all(|movement| movement.supports_builtin_heuristic());
+    let h = |p: BlockPos| -> Cost {
+        if use_heuristic {
+            heuristic(p, goal, ctx)
+        } else {
+            0
+        }
+    };
+    let manhattan = |p: BlockPos| -> u64 {
+        u64::from(p.x.abs_diff(goal.x))
+            + u64::from(p.y.abs_diff(goal.y))
+            + u64::from(p.z.abs_diff(goal.z))
+    };
+    let goal_tolerance = u64::from(ctx.goal_tolerance.max(0) as u32);
     let key = |p: BlockPos| -> Key { (p.x, p.y, p.z) };
 
     let mut nodes: HashMap<Key, NodeData> = HashMap::new();
@@ -155,7 +175,7 @@ pub fn find_path(
         }
 
         let current_lava_risk = cached_lava_risk(pos, world, ctx, &mut lava_risks);
-        if manhattan(pos) <= ctx.goal_tolerance && lava_safe_to_finish(current_lava_risk, ctx) {
+        if manhattan(pos) <= goal_tolerance && lava_safe_to_finish(current_lava_risk, ctx) {
             return Ok(reconstruct(&nodes, pos, g));
         }
 
@@ -224,9 +244,22 @@ pub fn find_path_best_effort(
     moves: &[Box<dyn Move>],
     ctx: &MoveContext,
 ) -> (Path, bool) {
-    let h = |p: BlockPos| -> Cost { heuristic(p, goal, ctx) };
-    let manhattan =
-        |p: BlockPos| -> i32 { (p.x - goal.x).abs() + (p.y - goal.y).abs() + (p.z - goal.z).abs() };
+    let use_heuristic = moves
+        .iter()
+        .all(|movement| movement.supports_builtin_heuristic());
+    let h = |p: BlockPos| -> Cost {
+        if use_heuristic {
+            heuristic(p, goal, ctx)
+        } else {
+            0
+        }
+    };
+    let manhattan = |p: BlockPos| -> u64 {
+        u64::from(p.x.abs_diff(goal.x))
+            + u64::from(p.y.abs_diff(goal.y))
+            + u64::from(p.z.abs_diff(goal.z))
+    };
+    let goal_tolerance = u64::from(ctx.goal_tolerance.max(0) as u32);
     let key = |p: BlockPos| -> Key { (p.x, p.y, p.z) };
 
     let mut nodes: HashMap<Key, NodeData> = HashMap::new();
@@ -265,7 +298,7 @@ pub fn find_path_best_effort(
             continue;
         }
         let current_lava_risk = cached_lava_risk(pos, world, ctx, &mut lava_risks);
-        if manhattan(pos) <= ctx.goal_tolerance && lava_safe_to_finish(current_lava_risk, ctx) {
+        if manhattan(pos) <= goal_tolerance && lava_safe_to_finish(current_lava_risk, ctx) {
             return (reconstruct(&nodes, pos, g), true);
         }
         let md = manhattan(pos);
@@ -455,14 +488,95 @@ mod tests {
         );
         // Horizontal-dominant cases keep the octile value (vertical term folds
         // in via max(), never adds on top — so it can't overestimate).
-        assert_eq!(heuristic(BlockPos::new(10, 0, 0), goal, &ctx), 100);
-        assert_eq!(heuristic(BlockPos::new(10, 2, 0), goal, &ctx), 100);
+        assert_eq!(heuristic(BlockPos::new(10, 0, 0), goal, &ctx), 90);
+        assert_eq!(heuristic(BlockPos::new(10, 2, 0), goal, &ctx), 90);
         // A one-level descent can be a cheap stair step, so the fall-based
         // bound must never overestimate it.
+        assert_eq!(heuristic(BlockPos::new(0, 1, 0), goal, &ctx), 0);
+    }
+
+    #[test]
+    fn heuristic_respects_cheaper_horizontal_jump_and_fall_costs() {
+        let mut ctx = ctx();
+        ctx.costs.cardinal_walk = 100;
+        ctx.costs.diagonal_walk = 140;
+        ctx.costs.step = 50;
+        ctx.costs.jump = 2;
+        ctx.costs.fall_base = 1;
+        ctx.costs.fall_per_block = 1;
+
+        // Built-in jump/fall moves advance horizontally, so their configured
+        // cost is also a lower bound for horizontal progress.
         assert_eq!(
-            heuristic(BlockPos::new(0, 1, 0), goal, &ctx),
-            ctx.costs.step
+            heuristic(BlockPos::new(0, 64, 0), BlockPos::new(3, 64, 0), &ctx),
+            4
         );
+    }
+
+    #[test]
+    fn heuristic_prices_the_nearest_accepted_goal_not_the_exact_block() {
+        let mut ctx = ctx();
+        ctx.goal_tolerance = 2;
+        assert_eq!(
+            heuristic(BlockPos::new(0, 64, 0), BlockPos::new(5, 64, 0), &ctx),
+            ctx.costs.cardinal_walk * 3
+        );
+        assert_eq!(
+            heuristic(BlockPos::new(3, 64, 0), BlockPos::new(5, 64, 0), &ctx),
+            0
+        );
+    }
+
+    struct CheapDetourMove;
+
+    impl Move for CheapDetourMove {
+        fn candidates(
+            &self,
+            from: BlockPos,
+            _world: &dyn WorldView,
+            _ctx: &MoveContext,
+            out: &mut Vec<Edge>,
+        ) {
+            let start = BlockPos::new(0, 64, 0);
+            let detour = BlockPos::new(-100, 64, 0);
+            let goal = BlockPos::new(10, 64, 0);
+            if from == start {
+                out.push(Edge {
+                    to: detour,
+                    kind: MoveKind::Jump,
+                    cost: 1,
+                });
+            } else if from == detour {
+                out.push(Edge {
+                    to: goal,
+                    kind: MoveKind::Jump,
+                    cost: 1,
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn custom_long_range_moves_fall_back_to_optimal_dijkstra_search() {
+        let mut grid = Grid::new();
+        grid.floor(-2..=12, -1..=1, 63);
+        let mut moves = default_moves();
+        moves.push(Box::new(CheapDetourMove));
+        let ctx = MoveContext {
+            goal_tolerance: 0,
+            ..ctx()
+        };
+
+        let path = find_path(
+            &grid,
+            BlockPos::new(0, 64, 0),
+            BlockPos::new(10, 64, 0),
+            &moves,
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(path.total_cost, 2);
+        assert_eq!(path.nodes[1].pos, BlockPos::new(-100, 64, 0));
     }
 
     #[test]

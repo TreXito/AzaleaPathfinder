@@ -116,6 +116,14 @@ pub trait Move: Send + Sync {
         ctx: &MoveContext,
         out: &mut Vec<Edge>,
     );
+
+    /// Whether every edge produced by this rule obeys the one-block movement
+    /// limits assumed by the built-in A* heuristic. The conservative default
+    /// keeps custom long-range or unusually cheap moves optimal by falling
+    /// back to Dijkstra search.
+    fn supports_builtin_heuristic(&self) -> bool {
+        false
+    }
 }
 
 /// The standard legit move set: walk, jump up one, fall off ledges, plus
@@ -300,6 +308,10 @@ impl Move for WalkMove {
             }
         }
     }
+
+    fn supports_builtin_heuristic(&self) -> bool {
+        true
+    }
 }
 
 /// Jump up a single block step in a cardinal direction.
@@ -328,6 +340,10 @@ impl Move for JumpMove {
                 });
             }
         }
+    }
+
+    fn supports_builtin_heuristic(&self) -> bool {
+        true
     }
 }
 
@@ -371,6 +387,10 @@ impl Move for FallMove {
                 }
             }
         }
+    }
+
+    fn supports_builtin_heuristic(&self) -> bool {
+        true
     }
 }
 

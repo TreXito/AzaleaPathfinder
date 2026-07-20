@@ -153,7 +153,7 @@ impl PathFollower {
         let idx = usize::from(path.nodes.len() >= 2);
         Self {
             path,
-            max_turn: settings.minimum_turn_degrees + turn_jitter as f32,
+            max_turn: settings.minimum_turn_degrees.max(0.0) + turn_jitter as f32,
             settings,
             idx,
             last_progress_idx: idx,
@@ -294,6 +294,7 @@ pub fn steering_direction(
     max_turn: f32,
     settings: &FollowerSettings,
 ) -> (f32, f32) {
+    let max_turn = max_turn.max(0.0);
     let dx = target.x - position.x;
     let dz = target.z - position.z;
     let desired_yaw = f64::atan2(-dx, dz).to_degrees() as f32 + yaw_bias;
@@ -321,6 +322,10 @@ pub fn furthest_visible(
     idx: usize,
     settings: &FollowerSettings,
 ) -> usize {
+    if nodes.is_empty() {
+        return 0;
+    }
+    let idx = idx.min(nodes.len() - 1);
     let mut best = idx;
     let y = nodes[idx].pos.y;
     let limit = idx
@@ -361,16 +366,22 @@ pub fn line_walkable(
         if !world.standable(center) || position_lava_risk(world, center, settings.lava_policy) > 0 {
             return false;
         }
-        let blocks_body = |block| matches!(block, BlockKind::Solid | BlockKind::Fence);
         for side in [
             settings.body_half_width.max(0.0),
             -settings.body_half_width.max(0.0),
         ] {
             let x = (cx + perp_x * side).floor() as i32;
             let z = (cz + perp_z * side).floor() as i32;
-            if blocks_body(world.block(BlockPos::new(x, feet_y, z)))
-                || blocks_body(world.block(BlockPos::new(x, feet_y + 1, z)))
-            {
+            // A slab/stair at the body's lower edge still collides even though
+            // it is a valid center-line foothold. At head height only full
+            // solids and fences block the body.
+            if matches!(
+                world.block(BlockPos::new(x, feet_y, z)),
+                BlockKind::Solid | BlockKind::Fence | BlockKind::Step
+            ) || matches!(
+                world.block(BlockPos::new(x, feet_y + 1, z)),
+                BlockKind::Solid | BlockKind::Fence
+            ) {
                 return false;
             }
         }
@@ -535,5 +546,71 @@ mod tests {
             64,
             &FollowerSettings::default()
         ));
+    }
+
+    #[test]
+    fn shortcut_body_edge_does_not_clip_a_step_block() {
+        let mut world = floor();
+        world.0.insert((2, 64, 1), BlockKind::Step);
+        assert!(!line_walkable(
+            &world,
+            Vec3::new(0.5, 64.0, 0.8),
+            Vec3::new(4.5, 64.0, 0.8),
+            64,
+            &FollowerSettings::default()
+        ));
+    }
+
+    #[test]
+    fn furthest_visible_handles_empty_and_out_of_range_paths() {
+        let world = floor();
+        let settings = FollowerSettings::default();
+        assert_eq!(
+            furthest_visible(&world, Vec3::new(0.5, 64.0, 0.5), &[], 99, &settings),
+            0
+        );
+        assert_eq!(
+            furthest_visible(
+                &world,
+                Vec3::new(0.5, 64.0, 0.5),
+                &path().nodes,
+                99,
+                &settings
+            ),
+            4
+        );
+    }
+
+    #[test]
+    fn negative_turn_limit_is_safely_clamped() {
+        let settings = FollowerSettings {
+            minimum_turn_degrees: -20.0,
+            turn_jitter_degrees: 0,
+            ..FollowerSettings::default()
+        };
+        let mut follower = PathFollower::new(path(), settings.clone(), 7);
+        let FollowerDirective::Move { max_turn, .. } = follower.tick(
+            &floor(),
+            FollowerFrame {
+                position: Vec3::new(0.5, 64.0, 0.5),
+                on_ground: true,
+                horizontal_collision: false,
+                paused: false,
+            },
+        ) else {
+            panic!("expected a movement directive");
+        };
+        assert_eq!(max_turn, 0.0);
+        let (yaw, pitch) = steering_direction(
+            Vec3::new(0.5, 64.0, 0.5),
+            0.0,
+            0.0,
+            Vec3::new(4.5, 64.0, 0.5),
+            0.0,
+            0.0,
+            -20.0,
+            &settings,
+        );
+        assert_eq!((yaw, pitch), (0.0, 0.0));
     }
 }

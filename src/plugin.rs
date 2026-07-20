@@ -36,7 +36,10 @@ pub struct PathfinderSettings {
 impl Default for PathfinderSettings {
     fn default() -> Self {
         Self {
-            dynamic_replan_ticks: 5,
+            // Dynamic publishers already trigger an immediate replan by
+            // changing position/revision. Periodic same-goal replanning is an
+            // opt-in fallback because it pauses movement while planning.
+            dynamic_replan_ticks: 0,
             max_plan_legs: 16,
             snapshot_margin: 10,
             snapshot_max_span_xz: 128,
@@ -101,7 +104,6 @@ struct NavigationTask(Task<PlanResult>);
 #[derive(Component)]
 struct ActiveNavigation {
     follower: PathFollower,
-    snapshot: WorldSnapshot,
     reached_goal: bool,
     legs: u32,
     dynamic_ticks: u32,
@@ -113,7 +115,6 @@ struct NavigationTerminal;
 struct PlanResult {
     request: NavigationRequest,
     path: crate::Path,
-    snapshot: WorldSnapshot,
     reached_goal: bool,
     legs: u32,
 }
@@ -162,6 +163,7 @@ fn start_requested_navigation(
         Option<&ActiveNavigation>,
         Option<&NavigationTerminal>,
     )>,
+    mut walk_events: MessageWriter<StartWalkEvent>,
 ) {
     for (entity, request, request_ref, position, world, task, active, terminal) in &query {
         let changed = request_ref.is_changed();
@@ -173,6 +175,9 @@ fn start_requested_navigation(
                 .entity(entity)
                 .remove::<(ActiveNavigation, NavigationTask, NavigationTerminal)>();
         }
+        // A replaced request must not inherit the previous follower's forward
+        // input while its new plan is being computed.
+        stop(entity, &mut walk_events);
         let task = spawn_plan(
             *request,
             BlockPos::from(&**position),
@@ -207,7 +212,6 @@ fn spawn_plan(
         PlanResult {
             request,
             path,
-            snapshot,
             reached_goal,
             legs,
         }
@@ -244,7 +248,6 @@ fn poll_navigation_tasks(
         commands.entity(entity).insert((
             ActiveNavigation {
                 follower,
-                snapshot: result.snapshot,
                 reached_goal: result.reached_goal,
                 legs: result.legs,
                 dynamic_ticks: 0,
@@ -267,7 +270,7 @@ fn tick_navigation(
         Option<&NavigationPaused>,
         &Position,
         &Physics,
-        &LookDirection,
+        &mut LookDirection,
         &WorldHolder,
         &mut ActiveNavigation,
     )>,
@@ -275,17 +278,45 @@ fn tick_navigation(
     mut sprint_events: MessageWriter<StartSprintEvent>,
     mut jump_events: MessageWriter<JumpEvent>,
 ) {
-    for (entity, request, paused, position, physics, world, world_holder, mut active) in &mut query
+    for (entity, request, paused, position, physics, mut look, world_holder, mut active) in
+        &mut query
     {
         let paused = paused.is_some_and(|paused| paused.0);
-        let active_mut = &mut *active;
-        let directive = active_mut.follower.tick(
-            &active_mut.snapshot,
+        if paused {
+            let directive = active.follower.tick(
+                &UnavailableWorld,
+                FollowerFrame {
+                    position: **position,
+                    on_ground: physics.on_ground(),
+                    horizontal_collision: physics.horizontal_collision,
+                    paused: true,
+                },
+            );
+            debug_assert_eq!(directive, FollowerDirective::Paused);
+            stop(entity, &mut walk_events);
+            commands.entity(entity).insert(NavigationStatus::Paused {
+                generation: request.generation,
+            });
+            continue;
+        }
+
+        // Execution safety must use current blocks, not the potentially stale
+        // snapshot captured when A* ran. This small LOS snapshot is bounded by
+        // max_los_skip and the lava clearance margin.
+        let (low, high) = follower_snapshot_bounds(
+            **position,
+            active.follower.path(),
+            active.follower.current_node_index(),
+            &settings.follower,
+        );
+        let live_snapshot = WorldSnapshot::capture(&world_holder.shared, low, high);
+        let directive = active.follower.tick(
+            &live_snapshot,
             FollowerFrame {
                 position: **position,
                 on_ground: physics.on_ground(),
                 horizontal_collision: physics.horizontal_collision,
-                paused,
+                paused: false,
             },
         );
         match directive {
@@ -305,17 +336,15 @@ fn tick_navigation(
             } => {
                 let (yaw, pitch) = steering_direction(
                     **position,
-                    world.y_rot(),
-                    world.x_rot(),
+                    look.y_rot(),
+                    look.x_rot(),
                     target,
                     yaw_bias,
                     pitch_bias,
                     max_turn,
                     &settings.follower,
                 );
-                commands
-                    .entity(entity)
-                    .insert(LookDirection::new(yaw, pitch));
+                look.update(LookDirection::new(yaw, pitch));
                 if sprint {
                     sprint_events.write(StartSprintEvent {
                         entity,
@@ -382,6 +411,7 @@ fn tick_navigation(
             && settings.dynamic_replan_ticks > 0
             && active.dynamic_ticks >= settings.dynamic_replan_ticks
         {
+            stop(entity, &mut walk_events);
             let task = spawn_plan(
                 *request,
                 BlockPos::from(&**position),
@@ -433,6 +463,61 @@ fn stop_removed_navigation(
     }
 }
 
+struct UnavailableWorld;
+
+impl crate::WorldView for UnavailableWorld {
+    fn block(&self, _pos: BlockPos) -> crate::BlockKind {
+        crate::BlockKind::Unloaded
+    }
+}
+
+fn follower_snapshot_bounds(
+    position: azalea::Vec3,
+    path: &crate::Path,
+    index: usize,
+    settings: &FollowerSettings,
+) -> (BlockPos, BlockPos) {
+    if path.nodes.is_empty() {
+        let center = BlockPos::from(&position);
+        return (center, center);
+    }
+    let index = index.min(path.nodes.len().saturating_sub(1));
+    let limit = index
+        .saturating_add(settings.max_los_skip)
+        .min(path.nodes.len().saturating_sub(1));
+    let mut low = BlockPos::from(&position);
+    let mut high = low;
+    for node in &path.nodes[index..=limit] {
+        low = BlockPos::new(
+            low.x.min(node.pos.x),
+            low.y.min(node.pos.y),
+            low.z.min(node.pos.z),
+        );
+        high = BlockPos::new(
+            high.x.max(node.pos.x),
+            high.y.max(node.pos.y),
+            high.z.max(node.pos.z),
+        );
+    }
+    let clearance = match settings.lava_policy {
+        crate::LavaPolicy::Forbidden { clearance } => clearance.max(0),
+        crate::LavaPolicy::Penalized => 0,
+    };
+    let margin = clearance.saturating_add(1);
+    (
+        BlockPos::new(
+            low.x.saturating_sub(margin),
+            low.y.saturating_sub(margin),
+            low.z.saturating_sub(margin),
+        ),
+        BlockPos::new(
+            high.x.saturating_add(margin),
+            high.y.saturating_add(margin),
+            high.z.saturating_add(margin),
+        ),
+    )
+}
+
 fn snapshot_bounds(
     start: BlockPos,
     target: BlockPos,
@@ -440,15 +525,15 @@ fn snapshot_bounds(
 ) -> (BlockPos, BlockPos) {
     let axis = |start: i32, target: i32, max_span: i32| {
         let margin = settings.snapshot_margin.max(0);
-        let mut low = start.min(target) - margin;
-        let mut high = start.max(target) + margin;
-        if high - low > max_span {
+        let mut low = start.min(target).saturating_sub(margin);
+        let mut high = start.max(target).saturating_add(margin);
+        if i64::from(high) - i64::from(low) > i64::from(max_span) {
             if target >= start {
-                low = start - margin;
-                high = low + max_span;
+                low = start.saturating_sub(margin);
+                high = low.saturating_add(max_span);
             } else {
-                high = start + margin;
-                low = high - max_span;
+                high = start.saturating_add(margin);
+                low = high.saturating_sub(max_span);
             }
         }
         (low, high)
@@ -563,5 +648,65 @@ mod tests {
             .position(),
             position
         );
+    }
+
+    #[test]
+    fn follower_snapshot_bounds_cover_live_lookahead_and_lava_clearance() {
+        let path = crate::Path {
+            nodes: vec![
+                crate::PathNode {
+                    pos: BlockPos::new(10, 64, 10),
+                    reached_by: crate::MoveKind::Start,
+                },
+                crate::PathNode {
+                    pos: BlockPos::new(13, 65, 8),
+                    reached_by: crate::MoveKind::Walk,
+                },
+            ],
+            total_cost: 10,
+        };
+        let settings = FollowerSettings {
+            max_los_skip: 4,
+            lava_policy: crate::LavaPolicy::Forbidden { clearance: 2 },
+            ..FollowerSettings::default()
+        };
+        let (low, high) =
+            follower_snapshot_bounds(azalea::Vec3::new(9.5, 64.0, 11.5), &path, 0, &settings);
+        assert_eq!(low, BlockPos::new(6, 61, 5));
+        assert_eq!(high, BlockPos::new(16, 68, 14));
+    }
+
+    #[test]
+    fn follower_snapshot_bounds_handle_empty_paths() {
+        let path = crate::Path {
+            nodes: Vec::new(),
+            total_cost: 0,
+        };
+        let point = azalea::Vec3::new(1.5, 2.0, 3.5);
+        assert_eq!(
+            follower_snapshot_bounds(point, &path, 99, &FollowerSettings::default()),
+            (BlockPos::new(1, 2, 3), BlockPos::new(1, 2, 3))
+        );
+    }
+
+    #[test]
+    fn snapshot_bounds_do_not_overflow_at_world_integer_extremes() {
+        let settings = PathfinderSettings {
+            snapshot_margin: i32::MAX,
+            snapshot_max_span_xz: 32,
+            snapshot_max_span_y: 16,
+            ..PathfinderSettings::default()
+        };
+        let (low, high) = snapshot_bounds(
+            BlockPos::new(i32::MAX, i32::MIN, i32::MAX),
+            BlockPos::new(i32::MIN, i32::MAX, i32::MIN),
+            &settings,
+        );
+        assert!(low.x <= high.x && low.y <= high.y && low.z <= high.z);
+    }
+
+    #[test]
+    fn periodic_dynamic_replanning_is_opt_in() {
+        assert_eq!(PathfinderSettings::default().dynamic_replan_ticks, 0);
     }
 }

@@ -30,6 +30,10 @@ impl Move for AotvMove {
     ) {
         // inert until implemented — produces no candidate edges
     }
+
+    fn supports_builtin_heuristic(&self) -> bool {
+        true
+    }
 }
 
 /// Etherwarp: sneak + right-click teleport onto a distant block surface.
@@ -44,5 +48,9 @@ impl Move for EtherwarpMove {
         _out: &mut Vec<Edge>,
     ) {
         // inert until implemented — produces no candidate edges
+    }
+
+    fn supports_builtin_heuristic(&self) -> bool {
+        true
     }
 }

@@ -46,10 +46,12 @@ pub fn route(graph: &WorldGraph, from: usize, to: usize) -> Option<Vec<TravelSte
         done[current] = true;
 
         for (edge_idx, e) in graph.edges.iter().enumerate() {
-            if e.from != current {
+            // WorldGraph is public data and callers may construct it manually.
+            // Ignore malformed endpoints rather than indexing past `dist`.
+            if e.from != current || e.to >= n {
                 continue;
             }
-            let candidate = dist[current].unwrap() + e.cost;
+            let candidate = dist[current].unwrap().saturating_add(e.cost);
             if dist[e.to].is_none_or(|d| candidate < d) {
                 dist[e.to] = Some(candidate);
                 prev[e.to] = Some(edge_idx);
@@ -102,5 +104,31 @@ mod tests {
         let graph = WorldGraph::skyblock_default();
         let hub = graph.place_index("hub").unwrap();
         assert!(route(&graph, hub, hub).unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_public_edges_are_ignored_instead_of_panicking() {
+        let graph = WorldGraph {
+            places: vec![
+                crate::Place {
+                    id: "from",
+                    mode: None,
+                    anchor: None,
+                },
+                crate::Place {
+                    id: "to",
+                    mode: None,
+                    anchor: None,
+                },
+            ],
+            edges: vec![crate::GraphEdge {
+                from: 0,
+                to: usize::MAX,
+                edge: TravelEdge::Walk,
+                cost: 1,
+            }],
+        };
+
+        assert!(route(&graph, 0, 1).is_none());
     }
 }
