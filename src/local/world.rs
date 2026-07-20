@@ -24,8 +24,9 @@ pub enum BlockKind {
     /// bottom-half stairs, carpet. The cell itself is enterable (feet
     /// inside it) and it counts as floor for the cell above.
     Step,
-    /// Lava (source or flowing). Passable so the planner can cross it as a
-    /// last resort, but heavily penalized — see `moves::lava_penalty`.
+    /// Lava (source or flowing). Kept structurally occupiable so a bot already
+    /// in it can plan an exit and callers can explicitly select the penalized
+    /// legacy policy. The default planner forbids entering its safety buffer.
     Lava,
     /// Chunk not loaded — treated as impassable so paths never leave the
     /// known world. Long-distance travel is the router's job.
@@ -40,9 +41,9 @@ pub trait WorldView {
     /// Can the bot stand with its feet at `pos`? Either normally (clear
     /// cell over a solid or step floor) or inside a step cell (standing
     /// on the slab/stair, which raises the body half a block, so the
-    /// two cells above must be clear). Lava counts as an occupiable cell
-    /// and as a floor so the planner can cross it — the discouragement is
-    /// the cost penalty, not impassability.
+    /// two cells above must be clear). Lava remains occupiable here so an
+    /// already-trapped bot can generate outward moves; the central planner's
+    /// lava policy decides which of those transitions are legal.
     fn standable(&self, pos: BlockPos) -> bool {
         // where the body can be: air, or wading in lava
         let occupiable = |k: BlockKind| matches!(k, BlockKind::Air | BlockKind::Lava);
@@ -75,7 +76,7 @@ pub fn offset(p: BlockPos, dx: i32, dy: i32, dz: i32) -> BlockPos {
 /// Classify a block state. Slabs/stairs/carpet are recognized by their
 /// block-kind name plus orientation properties: only bottom variants are
 /// steps; top and double variants act like full blocks.
-fn classify_state(state: BlockState) -> BlockKind {
+pub fn classify_state(state: BlockState) -> BlockKind {
     if state.is_air() {
         return BlockKind::Air;
     }

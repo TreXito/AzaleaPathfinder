@@ -7,4 +7,6 @@ description = "Reusable block pathfinding and navigation plugin for Azalea clien
 [dependencies]
 azalea = { git = "https://github.com/RaymondShell/azalea", branch = "main" }
 bevy_ecs = "0.19"
+bevy_tasks = { version = "0.19", features = ["multi_threaded"] }
+futures-lite = "2"
 parking_lot = "0.12.5"

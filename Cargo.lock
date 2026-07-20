@@ -419,6 +419,8 @@ version = "0.1.0"
 dependencies = [
  "azalea",
  "bevy_ecs",
+ "bevy_tasks",
+ "futures-lite",
  "parking_lot",
 ]
 

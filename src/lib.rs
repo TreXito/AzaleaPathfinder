@@ -11,10 +11,17 @@ pub mod types;
 
 pub use graph::{GraphEdge, Place, TravelEdge, WorldGraph};
 pub use local::astar::{find_path, find_path_best_effort};
-pub use local::moves::{Move, MoveContext, default_moves};
-pub use local::world::{BlockKind, WorldSnapshot, WorldView};
+pub use local::follower::{
+    FollowerDirective, FollowerFrame, FollowerSettings, PathFollower, furthest_visible,
+    line_walkable, node_center, steering_direction,
+};
+pub use local::moves::{
+    LavaPolicy, Move, MoveContext, MovementCosts, default_moves, lava_risk, lava_transition_allowed,
+};
+pub use local::world::{BlockKind, WorldSnapshot, WorldView, classify_state};
 pub use plugin::{
-    AzaleaPathfinderPlugin, NavigationGoal, NavigationRequest, NavigationStatus, PathfinderSettings,
+    AzaleaPathfinderClientExt, AzaleaPathfinderPlugin, NavigationGoal, NavigationPaused,
+    NavigationRequest, NavigationStatus, PathfinderSettings,
 };
 pub use router::{TravelStep, route};
 pub use types::{Cost, MoveKind, Path, PathError, PathNode};
