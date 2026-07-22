@@ -330,7 +330,24 @@ impl PathFollower {
         // ends the climb: `OnClimbable` is decided by the block at the feet,
         // not by what the bot is facing.
         let climbing = nodes[self.idx].reached_by == crate::MoveKind::Climb;
-        let target = if parkour_blocks.is_some() || climbing {
+        // Fractional-height terrain - snow layers, and any partial block - is
+        // where the client and the server disagree about which column a grazing
+        // corner of the 0.6-wide body rests on. Corner-smoothing aims across a
+        // turn at a further node, and steering diagonally is exactly what pushes
+        // the hitbox off its lane and out over a taller neighbour: the +0.25
+        // step-up the anticheat cannot reproduce and every measured Simulation
+        // flag on this map landed on. The block itself is standable and the
+        // physics port is faithful, so the fix is not to change either - it is
+        // to keep the body out of the sub-pixel boundary case. On this terrain,
+        // aim at the immediate node's centre so the body tracks the column line
+        // and never overhangs the block beside it. The planner already prefers
+        // the even lane (`grazing_step_penalty`); this keeps the body on it when
+        // a crossing is unavoidable.
+        let on_fractional = matches!(
+            world.block(BlockPos::from(&frame.position)),
+            BlockKind::Step(_)
+        ) || matches!(world.block(nodes[self.idx].pos), BlockKind::Step(_));
+        let target = if parkour_blocks.is_some() || climbing || on_fractional {
             node_center(nodes[self.idx].pos)
         } else {
             let steer_idx =
@@ -934,6 +951,61 @@ mod tests {
                 }
             ),
             FollowerDirective::Arrived
+        );
+    }
+
+    #[test]
+    fn fractional_terrain_pins_the_steer_to_the_immediate_node() {
+        // A straight one-wide run of eight nodes. Over plain ground the follower
+        // smooths its steer far down the line and cuts corners; over
+        // fractional-height blocks - snow - that diagonal drift is what lifts a
+        // grazing corner of the 0.6-wide body onto a taller neighbour and
+        // desyncs it against the anticheat. So on that terrain the steer is
+        // pinned to the immediate node and the body stays centred on its lane.
+        let straight = || Path {
+            nodes: (0..=8)
+                .map(|x| PathNode {
+                    pos: BlockPos::new(x, 64, 0),
+                    reached_by: if x == 0 {
+                        crate::MoveKind::Start
+                    } else {
+                        crate::MoveKind::Walk
+                    },
+                })
+                .collect(),
+            total_cost: 80,
+        };
+        let frame = || FollowerFrame {
+            position: Vec3::new(0.5, 64.0, 0.5),
+            on_ground: true,
+            horizontal_collision: false,
+            paused: false,
+        };
+
+        // Plain ground below, air to walk through: the steer smooths to the far
+        // end of the visible run.
+        let smooth = Grid((-2..=10).map(|x| ((x, 63, 0), BlockKind::Solid)).collect());
+        let mut follower = PathFollower::new(straight(), FollowerSettings::default(), 7);
+        let FollowerDirective::Move { target, .. } = follower.tick(&smooth, frame()) else {
+            panic!("expected a Move over plain ground");
+        };
+        assert!(
+            target.x > 2.0,
+            "plain ground should smooth the steer far down the line, got x={}",
+            target.x
+        );
+
+        // Snow underfoot (a partial-height block in the feet's own cell): the
+        // same run pins the steer to the immediate node's centre.
+        let snowy = Grid((-2..=10).map(|x| ((x, 64, 0), BlockKind::Step(4))).collect());
+        let mut follower = PathFollower::new(straight(), FollowerSettings::default(), 7);
+        let FollowerDirective::Move { target, .. } = follower.tick(&snowy, frame()) else {
+            panic!("expected a Move over snow");
+        };
+        assert!(
+            (target.x - 1.5).abs() < 1e-9,
+            "snow should pin the steer to the immediate node centre, got x={}",
+            target.x
         );
     }
 

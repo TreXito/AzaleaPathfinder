@@ -186,7 +186,7 @@ impl Default for MoveContext {
             lava_proximity_penalty: 6,
             water_policy: WaterPolicy::default(),
             water_penalty: 400,
-            grazing_step_penalty: 30,
+            grazing_step_penalty: 50,
             fall_damage_penalty: 45,
             path_seed: 0,
             avoid: std::sync::Arc::default(),
