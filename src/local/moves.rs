@@ -268,21 +268,51 @@ fn dry_standable(world: &dyn WorldView, pos: BlockPos) -> bool {
     !in_water(world, pos) && !on_climbable(world, pos) && world.standable(pos)
 }
 
-/// Adds a cost for each adjacent wall at feet or head height.
+/// Standable neighbours counted as "open" enough for the wall toll to reach
+/// full strength. A block in the open has all eight; a one-wide corridor has
+/// about two. Below this the toll fades, above it is capped.
+const OPEN_ROOM: Cost = 6;
+
+/// Adds a cost for hugging a wall, scaled by how much room there is to not.
+///
+/// A flat per-wall toll is wrong in a corridor: every block there is against a
+/// wall, so the toll is the same everywhere and cannot pull the bot off the
+/// wall - there is nowhere to go. All it does is inflate the route's cost and,
+/// worse, tempt a detour that trades real distance for imaginary clearance.
+///
+/// So the toll is scaled by the standable room around the feet. In the open,
+/// where stepping one block over really does move the bot off the wall, it is
+/// full strength and pulls it to the centre line. In a one-wide passage, where
+/// there is no centre to find, it fades to almost nothing and the bot just
+/// walks the passage. This is the "depends on how many blocks he can use" rule:
+/// the penalty for being near a wall is only as large as the freedom to avoid
+/// it.
 pub fn wall_proximity_penalty(pos: BlockPos, world: &dyn WorldView, per_wall: Cost) -> Cost {
     if per_wall == 0 {
         return 0;
     }
     let is_wall = |b: BlockKind| matches!(b, BlockKind::Solid | BlockKind::Fence);
-    let mut penalty: Cost = 0;
+    let mut walls: Cost = 0;
     for (dx, dz) in CARDINALS {
         if is_wall(world.block(offset(pos, dx, 0, dz)))
             || is_wall(world.block(offset(pos, dx, 1, dz)))
         {
-            penalty += per_wall;
+            walls += 1;
         }
     }
-    penalty
+    // No walls: already central, and this skips the room scan for the vast
+    // majority of nodes, which are nowhere near anything.
+    if walls == 0 {
+        return 0;
+    }
+    let mut room: Cost = 0;
+    for (dx, dz) in CARDINALS.into_iter().chain(DIAGONALS) {
+        if world.standable(offset(pos, dx, 0, dz)) {
+            room += 1;
+        }
+    }
+    // walls * per_wall, scaled by (room capped at OPEN_ROOM) / OPEN_ROOM.
+    (per_wall * walls * room.min(OPEN_ROOM)) / OPEN_ROOM
 }
 
 /// Adds a flat cost when the player's feet, head, or floor touches lava.
@@ -460,10 +490,18 @@ impl Move for JumpMove {
             let to = offset(from, dx, 1, dz);
 
             if dry_standable(world, to) {
+                // A slab or stair only raises the body half a block, so getting
+                // onto one is closer to a step than to a full hop even when its
+                // block sits a level up. Charging it the cheaper `step` makes
+                // the planner route up a flight of slabs rather than pillar-hop
+                // full blocks beside it - which is what the slabs are for. The
+                // move is still a Jump so the follower does hop; only the price
+                // the search pays for it changes.
+                let onto_step = matches!(world.block(to), BlockKind::Step(_));
                 out.push(Edge {
                     to,
                     kind: MoveKind::Jump,
-                    cost: ctx.costs.jump,
+                    cost: if onto_step { ctx.costs.step } else { ctx.costs.jump },
                 });
             }
         }
@@ -1131,6 +1169,50 @@ mod tests {
             "stepping in ({}) is not cheaper than reaching up ({})",
             foot.cost,
             reach.cost
+        );
+    }
+    /// The wall toll scales with room: a corridor is charged far less than an
+    /// open plaza, because in a corridor there is no way to be more central.
+    #[test]
+    fn wall_toll_fades_in_a_corridor() {
+        use std::collections::HashMap;
+        struct Grid(HashMap<(i32, i32, i32), BlockKind>);
+        impl WorldView for Grid {
+            fn block(&self, p: BlockPos) -> BlockKind {
+                self.0.get(&(p.x, p.y, p.z)).copied().unwrap_or(BlockKind::Air)
+            }
+        }
+        // A one-wide east-west corridor at y=64: floor at 63, walls at z=+/-1.
+        let mut corridor = HashMap::new();
+        for x in -3..=3 {
+            corridor.insert((x, 63, 0), BlockKind::Solid); // floor
+            for h in 0..=1 {
+                corridor.insert((x, 64 + h, 1), BlockKind::Solid);  // wall
+                corridor.insert((x, 64 + h, -1), BlockKind::Solid); // wall
+            }
+        }
+        let corridor = Grid(corridor);
+
+        // An open plaza: a floor with a single wall block to the north, so the
+        // node is wall-adjacent but has room on every other side.
+        let mut plaza = HashMap::new();
+        for x in -3..=3 {
+            for z in -3..=3 {
+                plaza.insert((x, 63, z), BlockKind::Solid);
+            }
+        }
+        plaza.insert((0, 64, 1), BlockKind::Solid);
+        plaza.insert((0, 65, 1), BlockKind::Solid);
+        let plaza = Grid(plaza);
+
+        let here = BlockPos::new(0, 64, 0);
+        let in_corridor = wall_proximity_penalty(here, &corridor, 6);
+        let in_open = wall_proximity_penalty(here, &plaza, 6);
+
+        assert!(in_corridor > 0, "corridor should still cost a little");
+        assert!(
+            in_open > in_corridor,
+            "open plaza ({in_open}) should be charged more than a corridor ({in_corridor})"
         );
     }
 }

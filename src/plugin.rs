@@ -415,6 +415,47 @@ fn snap_to_standable(world: &WorldSnapshot, goal: BlockPos, lo: BlockPos, hi: Bl
     best.map(|(_, pos)| pos)
 }
 
+/// Directory the path visualiser reads, if set. One file per bot.
+fn path_viz_dir() -> Option<&'static str> {
+    static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| std::env::var("PF_PATH_DIR").ok()).as_deref()
+}
+
+/// Write one bot's planned path where a server-side script can draw it.
+///
+/// The format is deliberately trivial - a name, the goal, and a flat list of
+/// `x y z kind` lines - so the reader is a shell loop and a `/particle` command
+/// rather than anything that has to parse. A move kind per node is what lets the
+/// drawing colour a jump differently from a walk, which is the whole point:
+/// you can watch the bot decide to parkour a gap before it reaches it.
+fn write_path_viz(
+    profile: Option<&azalea::player::GameProfileComponent>,
+    goal: BlockPos,
+    path: &crate::Path,
+) {
+    let Some(dir) = path_viz_dir() else { return };
+    let Some(profile) = profile else { return };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let mut out = format!("{}\n{} {} {}\n", profile.name, goal.x, goal.y, goal.z);
+    for node in &path.nodes {
+        use std::fmt::Write;
+        let kind = match node.reached_by {
+            crate::MoveKind::Start => "start",
+            crate::MoveKind::Walk => "walk",
+            crate::MoveKind::Jump => "jump",
+            crate::MoveKind::Parkour { .. } => "parkour",
+            crate::MoveKind::Climb => "climb",
+            crate::MoveKind::Fall => "fall",
+            crate::MoveKind::Swim => "swim",
+            crate::MoveKind::Aotv | crate::MoveKind::Etherwarp => "warp",
+        };
+        let _ = writeln!(out, "{} {} {} {}", node.pos.x, node.pos.y, node.pos.z, kind);
+    }
+    let _ = std::fs::write(format!("{dir}/{}.path", profile.name), out);
+}
+
 #[allow(clippy::type_complexity)]
 fn poll_navigation_tasks(
     mut commands: Commands,
@@ -426,9 +467,10 @@ fn poll_navigation_tasks(
         &WorldHolder,
         Option<&AvoidMemory>,
         &Physics,
+        Option<&azalea::player::GameProfileComponent>,
     )>,
 ) {
-    for (entity, current, mut task, world_holder, avoid, physics) in &mut query {
+    for (entity, current, mut task, world_holder, avoid, physics, profile) in &mut query {
         let avoid = avoid.map(AvoidMemory::snapshot).unwrap_or_default();
         let Some(result) = future::block_on(future::poll_once(&mut task.0)) else {
             continue;
@@ -538,6 +580,11 @@ fn poll_navigation_tasks(
                     .collect::<Vec<_>>(),
             );
         }
+        // Publish the planned path for the in-game visualiser, if one is
+        // watching. Written here, on every (re)plan, so what the player sees
+        // ingame is exactly the route the follower is about to walk - and it
+        // refreshes the instant the bot changes its mind.
+        write_path_viz(profile, current.goal.position(), &result.path);
         let follower = PathFollower::new(result.path, settings.follower.clone(), current.path_seed);
         commands.entity(entity).insert((
             ActiveNavigation {
