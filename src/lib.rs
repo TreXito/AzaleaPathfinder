@@ -13,12 +13,13 @@ pub use local::follower::{
     line_walkable, node_center, steering_direction,
 };
 pub use local::moves::{
-    LavaPolicy, Move, MoveContext, MovementCosts, default_moves, lava_risk, lava_transition_allowed,
+    ClimbMove, LavaPolicy, Move, MoveContext, MovementCosts, WaterPolicy, default_moves,
+    lava_risk, lava_transition_allowed,
 };
 pub use local::world::{BlockKind, WorldSnapshot, WorldView, classify_state};
 pub use plugin::{
     AzaleaPathfinderClientExt, AzaleaPathfinderPlugin, NavigationGoal, NavigationPaused,
-    NavigationRequest, NavigationStatus, PathfinderSettings,
+    NavigationRequest, NavigationStatus, NavigationSystems, PathfinderSettings,
 };
 pub use router::{TravelStep, route};
 pub use types::{Cost, MoveKind, Path, PathError, PathNode};

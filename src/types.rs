@@ -13,6 +13,25 @@ pub enum MoveKind {
     Walk,
     Jump,
     Fall,
+    /// A running jump across a gap, landing `blocks` away horizontally.
+    ///
+    /// Unlike [`MoveKind::Jump`], which steps up onto an adjacent block, there
+    /// is nothing under the middle of this move, so the follower has to jump
+    /// on its own rather than waiting to bump into something.
+    Parkour { blocks: u8, rise: i8 },
+    /// Climbing a ladder, vine or scaffolding, or stepping off one onto a
+    /// ledge.
+    ///
+    /// The only move that gains height without a jump. The follower holds the
+    /// jump key, which is what ascends a ladder in vanilla, and steers into
+    /// the ladder's own column, because leaving it is what stops the climb.
+    Climb,
+    /// Swimming through water, into it, or out of it onto a ledge.
+    ///
+    /// The bot floats instead of standing, so the follower holds the jump key
+    /// rather than waiting for the ground contact that never comes: in water
+    /// jump is the swim-up input, and it is the only way onto a bank.
+    Swim,
     Aotv,
     Etherwarp,
 }
