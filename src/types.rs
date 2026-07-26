@@ -18,7 +18,10 @@ pub enum MoveKind {
     /// Unlike [`MoveKind::Jump`], which steps up onto an adjacent block, there
     /// is nothing under the middle of this move, so the follower has to jump
     /// on its own rather than waiting to bump into something.
-    Parkour { blocks: u8, rise: i8 },
+    Parkour {
+        blocks: u8,
+        rise: i8,
+    },
     /// Climbing a ladder, vine or scaffolding, or stepping off one onto a
     /// ledge.
     ///

@@ -32,19 +32,14 @@ impl Default for LavaPolicy {
 /// Escaping water is always permitted, exactly as a bot that starts inside the
 /// lava buffer may still walk out of it. Refusing that would strand any bot
 /// that spawned or fell in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WaterPolicy {
     /// Never plan a move that ends with the feet in water. From inside water,
     /// only moves that leave it are offered.
+    #[default]
     Forbidden,
     /// Allow swimming, with [`MoveContext::water_penalty`] added per edge.
     Penalized,
-}
-
-impl Default for WaterPolicy {
-    fn default() -> Self {
-        Self::Forbidden
-    }
 }
 
 /// Movement costs in tenths of a flat block.
@@ -142,7 +137,7 @@ pub struct MoveContext {
     /// Toll for standing on a partial block with a taller partial block beside
     /// it. See `grazing_step_penalty` in the search.
     ///
-    /// Three blocks of walking: enough to prefer the even part of a snowfield,
+    /// Five blocks of walking: enough to prefer the even part of a snowfield,
     /// far too little to refuse a mountain made of the stuff. Set to 0 to
     /// restore the previous behaviour exactly.
     pub grazing_step_penalty: Cost,
@@ -236,6 +231,7 @@ pub fn default_moves() -> Vec<Box<dyn Move>> {
 
 const CARDINALS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
 const DIAGONALS: [(i32, i32); 4] = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
+pub const MAX_LAVA_SCAN_RADIUS: i32 = 32;
 
 /// Whether the bot's feet are in water at `pos`, and so swimming rather than
 /// standing on anything.
@@ -328,7 +324,7 @@ pub fn lava_penalty(pos: BlockPos, world: &dyn WorldView, per: Cost) -> Cost {
 
 /// Returns lava exposure within `clearance`; zero means safe.
 pub fn lava_risk(pos: BlockPos, world: &dyn WorldView, clearance: i32) -> Cost {
-    let clearance = clearance.max(0);
+    let clearance = clearance.clamp(0, MAX_LAVA_SCAN_RADIUS);
     let mut nearest: Option<i32> = None;
     for dx in -clearance..=clearance {
         for dz in -clearance..=clearance {
@@ -367,6 +363,7 @@ pub fn lava_proximity_penalty(
     if per_block == 0 || radius <= 0 {
         return 0;
     }
+    let radius = radius.min(MAX_LAVA_SCAN_RADIUS);
 
     // Use the nearest lava so large pools do not multiply the cost.
     for distance in 1..=radius {
@@ -415,9 +412,7 @@ impl Move for WalkMove {
                 });
             }
         }
-        let body_clear = |p: BlockPos| {
-            open(world, p) && open(world, offset(p, 0, 1, 0))
-        };
+        let body_clear = |p: BlockPos| open(world, p) && open(world, offset(p, 0, 1, 0));
         for (dx, dz) in DIAGONALS {
             let to = offset(from, dx, 0, dz);
             if dry_standable(world, to)
@@ -501,7 +496,11 @@ impl Move for JumpMove {
                 out.push(Edge {
                     to,
                     kind: MoveKind::Jump,
-                    cost: if onto_step { ctx.costs.step } else { ctx.costs.jump },
+                    cost: if onto_step {
+                        ctx.costs.step
+                    } else {
+                        ctx.costs.jump
+                    },
                 });
             }
         }
@@ -652,7 +651,7 @@ impl Move for ParkourMove {
         // often have nothing underneath them at all, so requiring solid ground
         // below the takeoff silently disables parkour across exactly the
         // terrain that needs it.
-        let debug = std::env::var("PF_PARKOUR_DEBUG").is_ok();
+        let debug = crate::debug::parkour_enabled();
         if debug {
             eprintln!(
                 "parkour@{:?}: here={:?} below={:?} up1={:?} up2={:?} east={:?} east2={:?} east3={:?} east4={:?}",
@@ -758,8 +757,11 @@ impl Move for ParkourMove {
                         blocks: blocks as u8,
                         rise: rise as i8,
                     },
-                    cost: ctx.costs.parkour_per_block * blocks as Cost
-                        + ctx.costs.jump * rise as Cost,
+                    cost: ctx
+                        .costs
+                        .parkour_per_block
+                        .saturating_mul(blocks as Cost)
+                        .saturating_add(ctx.costs.jump.saturating_mul(rise as Cost)),
                 });
             }
 
@@ -778,7 +780,13 @@ impl Move for ParkourMove {
             for drop in 1..=ctx.max_fall {
                 let to = offset(from, ox, -drop, oz);
                 if !dry_standable(world, to) {
-                    break;
+                    // Keep descending through clear air until the first viable
+                    // landing. Water, a ladder, unloaded space, or collision
+                    // at either body block ends the arc.
+                    if !open(world, to) || !open(world, offset(to, 0, 1, 0)) {
+                        break;
+                    }
+                    continue;
                 }
                 // The crossed columns must be a real gap for the whole descent,
                 // not just at takeoff height: if any of them can be stood on on
@@ -808,7 +816,10 @@ impl Move for ParkourMove {
                         blocks: blocks as u8,
                         rise: -drop as i8,
                     },
-                    cost: (ctx.costs.parkour_per_block * blocks as Cost)
+                    cost: ctx
+                        .costs
+                        .parkour_per_block
+                        .saturating_mul(blocks as Cost)
                         .saturating_add(ctx.costs.fall_per_block.saturating_mul(drop as Cost))
                         .saturating_add(ctx.fall_damage_penalty.saturating_mul(hurt)),
                 });
@@ -854,7 +865,9 @@ fn jump_offsets() -> impl Iterator<Item = (i32, i32)> {
     (-reach..=reach).flat_map(move |ox| {
         (-reach..=reach).filter_map(move |oz| {
             let distance = ((ox * ox + oz * oz) as f64).sqrt();
-            (distance >= 2.0 && distance <= MAX_FLAT_JUMP).then_some((ox, oz))
+            (2.0..=MAX_FLAT_JUMP)
+                .contains(&distance)
+                .then_some((ox, oz))
         })
     })
 }
@@ -867,13 +880,13 @@ fn jump_offsets() -> impl Iterator<Item = (i32, i32)> {
 fn crossed_columns(from: BlockPos, ox: i32, oz: i32) -> impl Iterator<Item = BlockPos> {
     let distance = ((ox * ox + oz * oz) as f64).sqrt();
     let steps = (distance * 4.0).ceil() as i32;
-    let landing = BlockPos::new(from.x + ox, from.y, from.z + oz);
+    let landing = offset(from, ox, 0, oz);
     let mut seen = Vec::new();
     for step in 1..steps {
         let t = step as f64 / steps as f64;
-        let x = from.x + (ox as f64 * t).round() as i32;
-        let z = from.z + (oz as f64 * t).round() as i32;
-        let pos = BlockPos::new(x, from.y, z);
+        let x = (ox as f64 * t).round() as i32;
+        let z = (oz as f64 * t).round() as i32;
+        let pos = offset(from, x, 0, z);
         // Both ends are checked separately: the takeoff is where we already
         // stand, and the landing is standable on purpose, so including it here
         // rejects every jump.
@@ -894,11 +907,7 @@ fn has_run_up(world: &dyn WorldView, from: BlockPos, ox: i32, oz: i32, back: i32
     let step = |v: i32| v.signum() * back;
     // A run-up along either axis of a diagonal jump still builds speed, so
     // accept the diagonal behind us or either of its cardinal halves.
-    let behind = [
-        (-step(ox), -step(oz)),
-        (-step(ox), 0),
-        (0, -step(oz)),
-    ];
+    let behind = [(-step(ox), -step(oz)), (-step(ox), 0), (0, -step(oz))];
     behind
         .iter()
         .filter(|(bx, bz)| (*bx, *bz) != (0, 0))
@@ -1017,8 +1026,7 @@ impl Move for SwimMove {
         // needs somewhere to rise into first. A two block bank is not climbable
         // from water at all, which is why only a single block rise is offered:
         // planning the taller one is what leaves a bot circling a pool forever.
-        let rise_room =
-            |p: BlockPos| open(world, p) || world.block(p) == BlockKind::Water;
+        let rise_room = |p: BlockPos| open(world, p) || world.block(p) == BlockKind::Water;
         if !rise_room(offset(from, 0, 1, 0)) || !rise_room(offset(from, 0, 2, 0)) {
             return;
         }
@@ -1058,10 +1066,7 @@ impl Move for FallMove {
     ) {
         for (dx, dz) in CARDINALS {
             let step = offset(from, dx, 0, dz);
-            if !open(world, step)
-                || !open(world, offset(step, 0, 1, 0))
-                || world.standable(step)
-            {
+            if !open(world, step) || !open(world, offset(step, 0, 1, 0)) || world.standable(step) {
                 continue;
             }
             // Stop at the first valid landing or obstruction.
@@ -1158,7 +1163,12 @@ mod tests {
         let world = Grid(blocks);
 
         let mut edges = Vec::new();
-        ClimbMove.candidates(BlockPos::new(1, 64, 0), &world, &MoveContext::default(), &mut edges);
+        ClimbMove.candidates(
+            BlockPos::new(1, 64, 0),
+            &world,
+            &MoveContext::default(),
+            &mut edges,
+        );
 
         let foot = edges.iter().find(|e| e.to == BlockPos::new(1, 64, 1));
         let reach = edges.iter().find(|e| e.to == BlockPos::new(1, 65, 1));
@@ -1171,6 +1181,44 @@ mod tests {
             reach.cost
         );
     }
+
+    #[test]
+    fn descending_parkour_finds_a_landing_below_the_first_drop() {
+        use std::collections::HashMap;
+
+        struct Grid(HashMap<(i32, i32, i32), BlockKind>);
+        impl WorldView for Grid {
+            fn block(&self, pos: BlockPos) -> BlockKind {
+                self.0
+                    .get(&(pos.x, pos.y, pos.z))
+                    .copied()
+                    .unwrap_or(BlockKind::Air)
+            }
+        }
+
+        let world = Grid(
+            [
+                ((-1, 63, 0), BlockKind::Solid),
+                ((0, 63, 0), BlockKind::Solid),
+                ((3, 60, 0), BlockKind::Solid),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let mut edges = Vec::new();
+        ParkourMove.candidates(
+            BlockPos::new(0, 64, 0),
+            &world,
+            &MoveContext::default(),
+            &mut edges,
+        );
+
+        assert!(
+            edges.iter().any(|edge| edge.to == BlockPos::new(3, 61, 0)),
+            "three-block-lower landing was not generated"
+        );
+    }
+
     /// The wall toll scales with room: a corridor is charged far less than an
     /// open plaza, because in a corridor there is no way to be more central.
     #[test]
@@ -1179,7 +1227,10 @@ mod tests {
         struct Grid(HashMap<(i32, i32, i32), BlockKind>);
         impl WorldView for Grid {
             fn block(&self, p: BlockPos) -> BlockKind {
-                self.0.get(&(p.x, p.y, p.z)).copied().unwrap_or(BlockKind::Air)
+                self.0
+                    .get(&(p.x, p.y, p.z))
+                    .copied()
+                    .unwrap_or(BlockKind::Air)
             }
         }
         // A one-wide east-west corridor at y=64: floor at 63, walls at z=+/-1.
@@ -1187,7 +1238,7 @@ mod tests {
         for x in -3..=3 {
             corridor.insert((x, 63, 0), BlockKind::Solid); // floor
             for h in 0..=1 {
-                corridor.insert((x, 64 + h, 1), BlockKind::Solid);  // wall
+                corridor.insert((x, 64 + h, 1), BlockKind::Solid); // wall
                 corridor.insert((x, 64 + h, -1), BlockKind::Solid); // wall
             }
         }

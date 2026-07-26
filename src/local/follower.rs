@@ -46,7 +46,6 @@ const WEDGE_TICKS: u32 = 5;
 /// the clearance either side.
 const WEDGE_OFF_CENTRE: f64 = 0.15;
 
-
 #[derive(Debug, Clone)]
 pub struct FollowerSettings {
     pub node_radius_xz: f64,
@@ -262,6 +261,51 @@ impl PathFollower {
         }
 
         let nodes = &self.path.nodes;
+        // Re-anchor after a server correction or knockback even when lava is
+        // not involved. The candidate must be close and the full live segment
+        // back to it must remain walkable.
+        let current = node_center(nodes[self.idx].pos);
+        let reanchor_radius = self
+            .settings
+            .passed_node_radius_xz
+            .max(self.settings.node_radius_xz)
+            .max(0.0);
+        if frame.on_ground
+            && dist_xz(frame.position, current)
+                > reanchor_radius + self.settings.node_radius_xz.max(0.0)
+            && let Some(reanchored) =
+                nearest_safe_prefix_node(world, frame.position, nodes, self.idx, &self.settings)
+        {
+            let candidate = node_center(nodes[reanchored].pos);
+            if dist_xz(frame.position, candidate) + self.settings.node_radius_xz.max(0.0)
+                < dist_xz(frame.position, current)
+            {
+                self.idx = reanchored;
+                self.last_progress_idx = reanchored;
+                self.stalled = 0;
+            }
+        }
+
+        // The server can correct/knock the player behind the follower's
+        // monotonic cursor while movement is paused for combat. If the direct
+        // transition to that stale cursor now crosses lava, re-anchor to the
+        // closest earlier path node that is both nearby and safely reachable.
+        // Without this, a perfectly valid path is abandoned because the
+        // follower tries to cut straight across the intervening terrain.
+        if !live_next_node_is_safe(
+            world,
+            frame.position,
+            nodes[self.idx].pos,
+            self.settings.lava_policy,
+            self.settings.line_sample_spacing,
+        ) && let Some(reanchored) =
+            nearest_safe_prefix_node(world, frame.position, nodes, self.idx, &self.settings)
+        {
+            self.idx = reanchored;
+            self.last_progress_idx = reanchored;
+            self.stalled = 0;
+        }
+
         while self.idx + 1 < nodes.len() {
             let current = node_center(nodes[self.idx].pos);
             let next = node_center(nodes[self.idx + 1].pos);
@@ -402,7 +446,7 @@ impl PathFollower {
                     self.escapes_used += 1;
                     self.escaping = ESCAPE_TICKS;
                     self.stalled = 0;
-                    if std::env::var("PF_NAV_DEBUG").is_ok() {
+                    if crate::debug::navigation_enabled() {
                         eprintln!(
                             "nav escape {} at {:.1},{:.1},{:.1} (node {} of {})",
                             self.escapes_used,
@@ -481,7 +525,7 @@ impl PathFollower {
         let at_edge = remaining <= planned - EDGE_MARGIN;
         let taking_off = parkour_blocks.is_some() && at_edge;
         if let Some(blocks) = parkour_blocks
-            && std::env::var("PF_PARKOUR_DEBUG").is_ok()
+            && crate::debug::parkour_enabled()
         {
             eprintln!(
                 "parkour follow: at {:.2},{:.2},{:.2} on_ground={} -> target {:.2},{:.2},{:.2} dist {:.2} blocks={blocks}",
@@ -714,7 +758,7 @@ pub fn furthest_visible(
         // exactly level run stopped smoothing at the first stair on the route,
         // which on this map is 38% of nodes, and an unsmoothed follower steers
         // at the block one step ahead and weaves along every grid staircase.
-        if (node.pos.y - y).abs() > 1
+        if node.pos.y.abs_diff(y) > 1
             || !line_walkable(world, position, node_center(node.pos), y, settings)
         {
             break;
@@ -752,7 +796,7 @@ pub fn line_walkable(
         let column = BlockPos::new(cx.floor() as i32, feet_y, cz.floor() as i32);
         let Some(center) = [0, 1, -1]
             .into_iter()
-            .map(|dy| BlockPos::new(column.x, feet_y + dy, column.z))
+            .map(|dy| super::world::offset(column, 0, dy, 0))
             .find(|p| world.standable(*p))
         else {
             return false;
@@ -761,10 +805,7 @@ pub fn line_walkable(
         // there. Smoothing is about walking, though: steering straight at a
         // node across a pond walks the bot into the pond, which is the one
         // place the planner just went out of its way to avoid.
-        if matches!(
-            world.block(center),
-            BlockKind::Water | BlockKind::Climbable
-        ) {
+        if matches!(world.block(center), BlockKind::Water | BlockKind::Climbable) {
             return false;
         }
         if position_lava_risk(world, center, settings.lava_policy) > 0 {
@@ -784,7 +825,7 @@ pub fn line_walkable(
                 world.block(BlockPos::new(x, center.y, z)),
                 BlockKind::Solid | BlockKind::Fence
             ) || matches!(
-                world.block(BlockPos::new(x, center.y + 1, z)),
+                world.block(super::world::offset(BlockPos::new(x, center.y, z), 0, 1, 0)),
                 BlockKind::Solid | BlockKind::Fence
             ) {
                 return false;
@@ -827,6 +868,43 @@ fn live_next_node_is_safe(
     })
 }
 
+fn nearest_safe_prefix_node(
+    world: &dyn WorldView,
+    position: Vec3,
+    nodes: &[PathNode],
+    idx: usize,
+    settings: &FollowerSettings,
+) -> Option<usize> {
+    let feet_y = BlockPos::from(&position).y;
+    let max_xz = settings
+        .passed_node_radius_xz
+        .max(settings.node_radius_xz)
+        .max(0.0);
+    let max_y = settings
+        .node_y_tolerance
+        .max(settings.arrival_y_tolerance)
+        .max(0.0);
+    (0..idx)
+        .filter(|&candidate| {
+            let target = node_center(nodes[candidate].pos);
+            dist_xz(position, target) <= max_xz
+                && (position.y - target.y).abs() <= max_y
+                && live_next_node_is_safe(
+                    world,
+                    position,
+                    nodes[candidate].pos,
+                    settings.lava_policy,
+                    settings.line_sample_spacing,
+                )
+                && line_walkable(world, position, target, feet_y, settings)
+        })
+        .min_by(|&a, &b| {
+            dist_xz(position, node_center(nodes[a].pos))
+                .total_cmp(&dist_xz(position, node_center(nodes[b].pos)))
+                .then_with(|| b.cmp(&a))
+        })
+}
+
 fn position_lava_risk(world: &dyn WorldView, pos: BlockPos, policy: LavaPolicy) -> u32 {
     match policy {
         LavaPolicy::Forbidden { clearance } => lava_risk(pos, world, clearance),
@@ -856,7 +934,7 @@ fn ladder_wall(world: &dyn WorldView, feet: BlockPos) -> Option<BlockPos> {
     }
     [(1, 0), (-1, 0), (0, 1), (0, -1)]
         .into_iter()
-        .map(|(dx, dz)| BlockPos::new(feet.x + dx, feet.y, feet.z + dz))
+        .map(|(dx, dz)| super::world::offset(feet, dx, 0, dz))
         .find(|pos| world.block(*pos) == BlockKind::Solid)
 }
 
@@ -921,6 +999,22 @@ mod tests {
                 })
                 .collect(),
             total_cost: 40,
+        }
+    }
+
+    fn path_to(x_end: i32) -> Path {
+        Path {
+            nodes: (0..=x_end)
+                .map(|x| PathNode {
+                    pos: BlockPos::new(x, 64, 0),
+                    reached_by: if x == 0 {
+                        crate::MoveKind::Start
+                    } else {
+                        crate::MoveKind::Walk
+                    },
+                })
+                .collect(),
+            total_cost: x_end as u32 * 10,
         }
     }
 
@@ -997,7 +1091,11 @@ mod tests {
 
         // Snow underfoot (a partial-height block in the feet's own cell): the
         // same run pins the steer to the immediate node's centre.
-        let snowy = Grid((-2..=10).map(|x| ((x, 64, 0), BlockKind::Step(4))).collect());
+        let snowy = Grid(
+            (-2..=10)
+                .map(|x| ((x, 64, 0), BlockKind::Step(4)))
+                .collect(),
+        );
         let mut follower = PathFollower::new(straight(), FollowerSettings::default(), 7);
         let FollowerDirective::Move { target, .. } = follower.tick(&snowy, frame()) else {
             panic!("expected a Move over snow");
@@ -1138,6 +1236,40 @@ mod tests {
             matches!(directive, FollowerDirective::Move { .. }),
             "gave up on a path it was actually on: {directive:?}"
         );
+    }
+
+    #[test]
+    fn server_setback_reanchors_without_a_lava_trigger() {
+        let world = Grid((-2..=10).map(|x| ((x, 63, 0), BlockKind::Solid)).collect());
+        let settings = FollowerSettings {
+            max_los_skip: 0,
+            ..FollowerSettings::default()
+        };
+        let mut follower = PathFollower::new(path_to(8), settings, 7);
+        for x in 1..=5 {
+            let _ = follower.tick(
+                &world,
+                FollowerFrame {
+                    position: Vec3::new(x as f64 + 0.5, 64.0, 0.5),
+                    on_ground: true,
+                    horizontal_collision: false,
+                    paused: false,
+                },
+            );
+        }
+
+        let directive = follower.tick(
+            &world,
+            FollowerFrame {
+                position: Vec3::new(1.5, 64.0, 0.5),
+                on_ground: true,
+                horizontal_collision: false,
+                paused: false,
+            },
+        );
+
+        assert!(follower.current_node_index() <= 2);
+        assert!(matches!(directive, FollowerDirective::Move { .. }));
     }
 }
 

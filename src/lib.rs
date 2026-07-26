@@ -1,5 +1,8 @@
 //! Path planning and navigation for Azalea clients.
 
+#![forbid(unsafe_code)]
+
+mod debug;
 pub mod graph;
 pub mod local;
 pub mod plugin;
@@ -13,10 +16,12 @@ pub use local::follower::{
     line_walkable, node_center, steering_direction,
 };
 pub use local::moves::{
-    ClimbMove, LavaPolicy, Move, MoveContext, MovementCosts, WaterPolicy, default_moves,
-    lava_risk, lava_transition_allowed,
+    ClimbMove, LavaPolicy, MAX_LAVA_SCAN_RADIUS, Move, MoveContext, MovementCosts, WaterPolicy,
+    default_moves, lava_risk, lava_transition_allowed,
 };
-pub use local::world::{BlockKind, WorldSnapshot, WorldView, classify_state};
+pub use local::world::{
+    BlockKind, MAX_SNAPSHOT_BLOCKS, SnapshotError, WorldSnapshot, WorldView, classify_state,
+};
 pub use plugin::{
     AzaleaPathfinderClientExt, AzaleaPathfinderPlugin, NavigationGoal, NavigationPaused,
     NavigationRequest, NavigationStatus, NavigationSystems, PathfinderSettings,

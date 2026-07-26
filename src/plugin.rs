@@ -17,8 +17,7 @@ use futures_lite::future;
 
 use crate::{
     FollowerDirective, FollowerFrame, FollowerSettings, MoveContext, PathFollower, WorldSnapshot,
-    WorldView,
-    default_moves, find_path_best_effort, steering_direction,
+    WorldView, default_moves, find_path_best_effort, steering_direction,
 };
 
 #[derive(Debug, Clone, Resource)]
@@ -121,6 +120,7 @@ struct NavigationTask(Task<PlanResult>);
 struct ActiveNavigation {
     follower: PathFollower,
     reached_goal: bool,
+    planned_goal: BlockPos,
     legs: u32,
     /// Consecutive legs that ended within [`STALL_RADIUS`] of where they began.
     stalled_legs: u32,
@@ -158,9 +158,13 @@ impl AvoidMemory {
         for dx in -AVOID_RADIUS..=AVOID_RADIUS {
             for dy in -AVOID_RADIUS..=AVOID_RADIUS {
                 for dz in -AVOID_RADIUS..=AVOID_RADIUS {
-                    let pos = BlockPos::new(at.x + dx, at.y + dy, at.z + dz);
-                    *self.spots.entry(pos).or_insert(0) =
-                        self.spots.get(&pos).copied().unwrap_or(0).saturating_add(AVOID_PENALTY);
+                    let pos = crate::local::world::offset(at, dx, dy, dz);
+                    *self.spots.entry(pos).or_insert(0) = self
+                        .spots
+                        .get(&pos)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(AVOID_PENALTY);
                 }
             }
         }
@@ -173,8 +177,9 @@ impl AvoidMemory {
 
 struct PlanResult {
     request: NavigationRequest,
-    path: crate::Path,
+    path: Option<crate::Path>,
     reached_goal: bool,
+    target: BlockPos,
     legs: u32,
     stalled_legs: u32,
     /// Where this leg was planned from, so "did this leg go anywhere" is
@@ -307,17 +312,6 @@ fn start_requested_navigation(
     }
 }
 
-/// `PF_NAV_DEBUG=1` traces every leg and every reason a leg ended.
-///
-/// Without it a stuck bot is indistinguishable from a walking one at any
-/// sampling rate a shell script can manage: the status flickers
-/// Planning/Following several times a second, so polling shows "Following"
-/// forever while the bot re-walks the same two metres.
-fn nav_debug() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PF_NAV_DEBUG").is_ok())
-}
-
 fn spawn_plan(
     request: NavigationRequest,
     start: BlockPos,
@@ -327,13 +321,50 @@ fn spawn_plan(
     stalled_legs: u32,
     avoid: std::sync::Arc<std::collections::HashMap<BlockPos, crate::Cost>>,
 ) -> Task<PlanResult> {
-    if nav_debug() {
-        eprintln!("nav plan leg {legs} from {start:?} with {} tolled blocks", avoid.len());
+    if crate::debug::navigation_enabled() {
+        eprintln!(
+            "nav plan leg {legs} from {start:?} with {} tolled blocks",
+            avoid.len()
+        );
     }
     AsyncComputeTaskPool::get().spawn(async move {
+        let started = std::time::Instant::now();
+        let total_budget = std::time::Duration::from_millis(settings.planner.time_budget_ms);
         let target = request.goal.position();
         let (lo, hi) = snapshot_bounds(start, target, &settings);
-        let snapshot = WorldSnapshot::capture(&world, lo, hi);
+        let Ok(snapshot) = WorldSnapshot::try_capture(&world, lo, hi) else {
+            return PlanResult {
+                request,
+                path: None,
+                reached_goal: false,
+                target,
+                legs,
+                stalled_legs,
+                start,
+            };
+        };
+        let Some(remaining) = total_budget.checked_sub(started.elapsed()) else {
+            return PlanResult {
+                request,
+                path: None,
+                reached_goal: false,
+                target,
+                legs,
+                stalled_legs,
+                start,
+            };
+        };
+        if remaining.is_zero() {
+            return PlanResult {
+                request,
+                path: None,
+                reached_goal: false,
+                target,
+                legs,
+                stalled_legs,
+                start,
+            };
+        }
         let mut context = settings.planner.clone();
         context.avoid = avoid;
         // Re-seed per leg. The search is deterministic, so replanning from the
@@ -349,12 +380,36 @@ fn spawn_plan(
         // clicked coordinates, where the Y is a guess. Snap to the nearest
         // standable block first so success means what a person means by it.
         let target = snap_to_standable(&snapshot, target, lo, hi).unwrap_or(target);
+        let Some(remaining) = total_budget.checked_sub(started.elapsed()) else {
+            return PlanResult {
+                request,
+                path: None,
+                reached_goal: false,
+                target,
+                legs,
+                stalled_legs,
+                start,
+            };
+        };
+        if remaining.is_zero() {
+            return PlanResult {
+                request,
+                path: None,
+                reached_goal: false,
+                target,
+                legs,
+                stalled_legs,
+                start,
+            };
+        }
+        context.time_budget_ms = remaining.as_millis().clamp(1, u128::from(u64::MAX)) as u64;
         let (path, reached_goal) =
             find_path_best_effort(&snapshot, start, target, &default_moves(), &context);
         PlanResult {
             request,
-            path,
+            path: Some(path),
             reached_goal,
+            target,
             legs,
             stalled_legs,
             start,
@@ -368,7 +423,12 @@ fn spawn_plan(
 /// wrong is nearly always a column that is right, so the floor below or the air
 /// above is what was meant. The radius is deliberately small, because snapping
 /// far enough to reach a *different* place would be worse than failing.
-fn snap_to_standable(world: &WorldSnapshot, goal: BlockPos, lo: BlockPos, hi: BlockPos) -> Option<BlockPos> {
+fn snap_to_standable(
+    world: &WorldSnapshot,
+    goal: BlockPos,
+    lo: BlockPos,
+    hi: BlockPos,
+) -> Option<BlockPos> {
     // A goal outside the snapshot is a goal we know nothing about, and snapping
     // it lands somewhere the box happens to end rather than somewhere the world
     // does. Climbing the hub mountain from sea level hit this exactly: the
@@ -377,7 +437,12 @@ fn snap_to_standable(world: &WorldSnapshot, goal: BlockPos, lo: BlockPos, hi: Bl
     // honestly reached it, and the bot reported Arrived while standing
     // three quarters of the way up. Leave a goal we cannot see where it is and
     // let the next leg, planned from higher up, see it properly.
-    if goal.y < lo.y || goal.y > hi.y || goal.x < lo.x || goal.x > hi.x || goal.z < lo.z || goal.z > hi.z
+    if goal.y < lo.y
+        || goal.y > hi.y
+        || goal.x < lo.x
+        || goal.x > hi.x
+        || goal.z < lo.z
+        || goal.z > hi.z
     {
         return None;
     }
@@ -399,7 +464,7 @@ fn snap_to_standable(world: &WorldSnapshot, goal: BlockPos, lo: BlockPos, hi: Bl
     for dy in -RADIUS_Y..=RADIUS_Y {
         for dx in -RADIUS..=RADIUS {
             for dz in -RADIUS..=RADIUS {
-                let candidate = BlockPos::new(goal.x + dx, goal.y + dy, goal.z + dz);
+                let candidate = crate::local::world::offset(goal, dx, dy, dz);
                 if !world.standable(candidate) {
                     continue;
                 }
@@ -418,7 +483,8 @@ fn snap_to_standable(world: &WorldSnapshot, goal: BlockPos, lo: BlockPos, hi: Bl
 /// Directory the path visualiser reads, if set. One file per bot.
 fn path_viz_dir() -> Option<&'static str> {
     static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    DIR.get_or_init(|| std::env::var("PF_PATH_DIR").ok()).as_deref()
+    DIR.get_or_init(|| std::env::var("PF_PATH_DIR").ok())
+        .as_deref()
 }
 
 /// Write one bot's planned path where a server-side script can draw it.
@@ -435,10 +501,13 @@ fn write_path_viz(
 ) {
     let Some(dir) = path_viz_dir() else { return };
     let Some(profile) = profile else { return };
+    let Some(safe_name) = sanitize_profile_name(&profile.name) else {
+        return;
+    };
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
-    let mut out = format!("{}\n{} {} {}\n", profile.name, goal.x, goal.y, goal.z);
+    let mut out = format!("{safe_name}\n{} {} {}\n", goal.x, goal.y, goal.z);
     for node in &path.nodes {
         use std::fmt::Write;
         let kind = match node.reached_by {
@@ -453,7 +522,26 @@ fn write_path_viz(
         };
         let _ = writeln!(out, "{} {} {} {}", node.pos.x, node.pos.y, node.pos.z, kind);
     }
-    let _ = std::fs::write(format!("{dir}/{}.path", profile.name), out);
+    let path = std::path::Path::new(dir).join(format!("bot-{safe_name}.path"));
+    let _ = std::fs::write(path, out);
+}
+
+fn sanitize_profile_name(profile_name: &str) -> Option<String> {
+    let safe_name = profile_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect::<String>();
+    if safe_name.is_empty() {
+        return None;
+    }
+    Some(safe_name)
 }
 
 #[allow(clippy::type_complexity)]
@@ -479,7 +567,16 @@ fn poll_navigation_tasks(
         if *current != result.request {
             continue;
         }
-        if result.reached_goal && result.path.nodes.len() < 2 {
+        let Some(path) = result.path else {
+            commands.entity(entity).insert((
+                NavigationStatus::Failed {
+                    generation: current.generation,
+                },
+                NavigationTerminal,
+            ));
+            continue;
+        };
+        if result.reached_goal && path.nodes.len() < 2 {
             commands.entity(entity).insert((
                 NavigationStatus::Arrived {
                     generation: current.generation,
@@ -493,15 +590,11 @@ fn poll_navigation_tasks(
         // says so with one node or with four. Following it is what produced the
         // Planning/Following flicker: instant arrival, instant replan, no
         // movement, until the leg budget ran out a minute later.
-        let end = result
-            .path
-            .nodes
-            .last()
-            .map_or(result.start, |node| node.pos);
-        let travelled = (end.x - result.start.x).abs()
-            + (end.y - result.start.y).abs()
-            + (end.z - result.start.z).abs();
-        if !result.reached_goal && travelled < STALL_RADIUS {
+        let end = path.nodes.last().map_or(result.start, |node| node.pos);
+        let travelled = u64::from(end.x.abs_diff(result.start.x))
+            + u64::from(end.y.abs_diff(result.start.y))
+            + u64::from(end.z.abs_diff(result.start.z));
+        if !result.reached_goal && travelled < STALL_RADIUS as u64 {
             // A block position taken mid-fall is not a place the planner can
             // reason about: the feet are in air with air underneath, so no move
             // applies and the plan comes back empty however good the route is.
@@ -529,7 +622,11 @@ fn poll_navigation_tasks(
             } else {
                 result.stalled_legs.saturating_add(1)
             };
-            let legs = if airborne { result.legs } else { result.legs + 1 };
+            let legs = if airborne {
+                result.legs
+            } else {
+                result.legs.saturating_add(1)
+            };
             if !airborne
                 && (stalled_legs > MAX_STALLED_LEGS || result.legs >= settings.max_plan_legs.max(1))
             {
@@ -560,18 +657,16 @@ fn poll_navigation_tasks(
             }
             continue;
         }
-        if nav_debug() {
-            let end = result.path.nodes.last().map(|node| node.pos);
+        if crate::debug::navigation_enabled() {
+            let end = path.nodes.last().map(|node| node.pos);
             eprintln!(
                 "nav leg {} from {:?} -> {} nodes, ends {:?}, reached_goal={}\n  steps: {:?}",
                 result.legs,
                 result.start,
-                result.path.nodes.len(),
+                path.nodes.len(),
                 end,
                 result.reached_goal,
-                result
-                    .path
-                    .nodes
+                path.nodes
                     .iter()
                     // The whole route, not a preview. Five nodes was enough to
                     // see where a leg started and never enough to see why it
@@ -584,12 +679,13 @@ fn poll_navigation_tasks(
         // watching. Written here, on every (re)plan, so what the player sees
         // ingame is exactly the route the follower is about to walk - and it
         // refreshes the instant the bot changes its mind.
-        write_path_viz(profile, current.goal.position(), &result.path);
-        let follower = PathFollower::new(result.path, settings.follower.clone(), current.path_seed);
+        write_path_viz(profile, current.goal.position(), &path);
+        let follower = PathFollower::new(path, settings.follower.clone(), current.path_seed);
         commands.entity(entity).insert((
             ActiveNavigation {
                 follower,
                 reached_goal: result.reached_goal,
+                planned_goal: result.target,
                 legs: result.legs,
                 stalled_legs: 0,
                 dynamic_ticks: 0,
@@ -661,7 +757,17 @@ fn tick_navigation(
             active.follower.current_node_index(),
             &settings.follower,
         );
-        let live_snapshot = WorldSnapshot::capture(&world_holder.shared, low, high);
+        let Ok(live_snapshot) = WorldSnapshot::try_capture(&world_holder.shared, low, high) else {
+            stop(entity, &mut walk_events);
+            commands.entity(entity).remove::<ActiveNavigation>();
+            commands.entity(entity).insert((
+                NavigationStatus::Failed {
+                    generation: request.generation,
+                },
+                NavigationTerminal,
+            ));
+            continue;
+        };
         let directive = active.follower.tick(
             &live_snapshot,
             FollowerFrame {
@@ -736,7 +842,14 @@ fn tick_navigation(
                     generation: request.generation,
                 });
             }
-            FollowerDirective::Arrived if active.reached_goal => {
+            FollowerDirective::Arrived
+                if active.reached_goal
+                    && position_reaches_goal(
+                        **position,
+                        active.planned_goal,
+                        settings.planner.goal_tolerance,
+                    ) =>
+            {
                 stop(entity, &mut walk_events);
                 commands.entity(entity).remove::<ActiveNavigation>();
                 commands.entity(entity).insert((
@@ -750,7 +863,7 @@ fn tick_navigation(
             FollowerDirective::Arrived
             | FollowerDirective::Stuck { .. }
             | FollowerDirective::Unsafe { .. } => {
-                if nav_debug() {
+                if crate::debug::navigation_enabled() {
                     eprintln!(
                         "nav leg {} ended {:?} at {:.1},{:.1},{:.1} (reached_goal={})",
                         active.legs,
@@ -766,12 +879,17 @@ fn tick_navigation(
                 // `Arrived` on a partial path is not a failure to blame: the
                 // leg did its job and the next one carries on from the end of
                 // it. Stuck and Unsafe are the two that repeat forever.
-                if let (Some(memory), FollowerDirective::Stuck { at } | FollowerDirective::Unsafe { at, .. }) =
-                    (avoid.as_deref_mut(), directive)
+                if let (
+                    Some(memory),
+                    FollowerDirective::Stuck { at } | FollowerDirective::Unsafe { at, .. },
+                ) = (avoid.as_deref_mut(), directive)
                 {
                     memory.blame(at);
                 }
-                let avoid = avoid.as_deref().map(AvoidMemory::snapshot).unwrap_or_default();
+                let avoid = avoid
+                    .as_deref()
+                    .map(AvoidMemory::snapshot)
+                    .unwrap_or_default();
                 if active.legs >= settings.max_plan_legs.max(1) {
                     commands.entity(entity).remove::<ActiveNavigation>();
                     commands.entity(entity).insert((
@@ -786,7 +904,7 @@ fn tick_navigation(
                         BlockPos::from(&**position),
                         world_holder.shared.clone(),
                         settings.clone(),
-                        active.legs + 1,
+                        active.legs.saturating_add(1),
                         active.stalled_legs,
                         avoid,
                     );
@@ -813,9 +931,12 @@ fn tick_navigation(
                 BlockPos::from(&**position),
                 world_holder.shared.clone(),
                 settings.clone(),
-                active.legs + 1,
+                active.legs,
                 active.stalled_legs,
-                avoid.as_deref().map(AvoidMemory::snapshot).unwrap_or_default(),
+                avoid
+                    .as_deref()
+                    .map(AvoidMemory::snapshot)
+                    .unwrap_or_default(),
             );
             commands.entity(entity).remove::<ActiveNavigation>();
             commands.entity(entity).insert((
@@ -898,7 +1019,9 @@ fn follower_snapshot_bounds(
         );
     }
     let clearance = match settings.lava_policy {
-        crate::LavaPolicy::Forbidden { clearance } => clearance.max(0),
+        crate::LavaPolicy::Forbidden { clearance } => {
+            clearance.clamp(0, crate::local::moves::MAX_LAVA_SCAN_RADIUS)
+        }
         crate::LavaPolicy::Penalized => 0,
     };
     let margin = clearance.saturating_add(1);
@@ -914,6 +1037,14 @@ fn follower_snapshot_bounds(
             high.z.saturating_add(margin),
         ),
     )
+}
+
+fn position_reaches_goal(position: azalea::Vec3, goal: BlockPos, tolerance: i32) -> bool {
+    let current = BlockPos::from(&position);
+    let distance = u64::from(current.x.abs_diff(goal.x))
+        + u64::from(current.y.abs_diff(goal.y))
+        + u64::from(current.z.abs_diff(goal.z));
+    distance <= u64::from(tolerance.max(0) as u32)
 }
 
 fn snapshot_bounds(
@@ -1049,5 +1180,33 @@ mod tests {
             follower_snapshot_bounds(azalea::Vec3::new(9.5, 64.0, 11.5), &path, 0, &settings);
         assert_eq!(low, BlockPos::new(6, 61, 5));
         assert_eq!(high, BlockPos::new(16, 68, 14));
+    }
+
+    #[test]
+    fn final_arrival_uses_only_the_planner_tolerance() {
+        let goal = BlockPos::new(10, 64, 0);
+        assert!(position_reaches_goal(
+            azalea::Vec3::new(9.5, 64.0, 0.5),
+            goal,
+            1
+        ));
+        assert!(!position_reaches_goal(
+            azalea::Vec3::new(7.6, 64.0, 0.5),
+            goal,
+            1
+        ));
+    }
+
+    #[test]
+    fn path_visualizer_names_cannot_escape_the_configured_directory() {
+        assert_eq!(
+            sanitize_profile_name("../bad/name\r\n"),
+            Some("___bad_name__".to_owned())
+        );
+        assert_eq!(
+            sanitize_profile_name("TreXito_42"),
+            Some("TreXito_42".to_owned())
+        );
+        assert_eq!(sanitize_profile_name(""), None);
     }
 }

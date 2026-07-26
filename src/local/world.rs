@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 
 use azalea::BlockPos;
 use azalea::block::fluid_state::{FluidKind, FluidState};
@@ -8,14 +9,18 @@ use azalea::physics::collision::BlockWithShape;
 use azalea::registry::builtin::BlockKind as AzaleaBlockKind;
 use azalea::world::World;
 
+/// Hard ceiling for one owned world snapshot.
+pub const MAX_SNAPSHOT_BLOCKS: u64 = 2_000_000;
+const SNAPSHOT_LOCK_BATCH_BLOCKS: usize = 16_384;
+
 /// Coarse classification of a block for pathfinding purposes.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockKind {
-    Air,
-    Solid,
+    Air = 0,
+    Solid = 1,
     /// A fence, wall, or gate. It blocks movement and cannot be used as a floor.
-    Fence,
+    Fence = 2,
     /// A bottom slab, bottom stair, carpet or snow layer that can be walked
     /// onto, carrying its collision height in sixteenths of a block.
     ///
@@ -29,6 +34,10 @@ pub enum BlockKind {
     /// sides holding identical block data. Without the height here the planner
     /// cannot tell a flat field of snow from a staircase of it.
     Step(u8),
+    /// Lava. It remains occupiable so a trapped bot can plan an exit.
+    Lava = 4,
+    /// Missing chunk data, treated as impassable.
+    Unloaded = 5,
     /// A block with no collision at all: grass, flowers, crops, torches, signs,
     /// rails, ladders, thin snow. The body walks straight through it, so it is
     /// empty space that happens to have a name.
@@ -37,19 +46,15 @@ pub enum BlockKind {
     /// standable floor, and 27% of the deleted tiles sat in clusters of four or
     /// more, so whole grass fields and crop farms became walls the planner
     /// would not cross while the bot stood in the middle of one.
-    Passable,
+    Passable = 6,
+    /// Water, including waterlogged blocks the body can pass through. The
+    /// player swims here: it neither supports weight nor makes the player fall.
+    Water = 7,
     /// A ladder, vine or scaffolding. The body passes through it and can hold
     /// position anywhere on it without anything underneath, which is the whole
     /// point: it is the only move in the game that gains height without a
     /// jump, and on a hand-built map it is usually the only way up a face.
-    Climbable,
-    /// Lava. It remains occupiable so a trapped bot can plan an exit.
-    Lava,
-    /// Water, including waterlogged blocks the body can pass through. The
-    /// player swims here: it neither supports weight nor makes the player fall.
-    Water,
-    /// Missing chunk data, treated as impassable.
-    Unloaded,
+    Climbable = 8,
 }
 
 /// The block data needed by the local planner.
@@ -112,7 +117,11 @@ fn sixteenths(height: f64) -> u8 {
 }
 
 pub fn offset(p: BlockPos, dx: i32, dy: i32, dz: i32) -> BlockPos {
-    BlockPos::new(p.x + dx, p.y + dy, p.z + dz)
+    BlockPos::new(
+        p.x.saturating_add(dx),
+        p.y.saturating_add(dy),
+        p.z.saturating_add(dz),
+    )
 }
 
 /// Reduces a Minecraft block state to the geometry used by the planner.
@@ -120,14 +129,15 @@ pub fn classify_state(state: BlockState) -> BlockKind {
     if state.is_air() {
         return BlockKind::Air;
     }
-    let name = format!("{:?}", AzaleaBlockKind::from(state));
-    if name == "Lava" {
+    let kind = AzaleaBlockKind::from(state);
+    let name = format!("{kind:?}");
+    if kind == AzaleaBlockKind::Lava {
         return BlockKind::Lava;
     }
     // A bubble column drags the player up or down with a velocity nothing here
     // models, so it stays impassable rather than becoming a swim the bot cannot
     // hold position in.
-    if name == "BubbleColumn" {
+    if kind == AzaleaBlockKind::BubbleColumn {
         return BlockKind::Solid;
     }
     // Asked before the shape tests because a ladder's collision box is not
@@ -135,7 +145,7 @@ pub fn classify_state(state: BlockState) -> BlockKind {
     // which turns the one route up a sheer face into a wall. The tag is the
     // same one azalea's own physics uses to decide `OnClimbable`, so the
     // planner and the client agree on what is a ladder by construction.
-    if azalea::registry::tags::blocks::CLIMBABLE.contains(&AzaleaBlockKind::from(state)) {
+    if azalea::registry::tags::blocks::CLIMBABLE.contains(&kind) {
         return BlockKind::Climbable;
     }
     // Waterlogging is a property of the block rather than a block of its own,
@@ -217,41 +227,104 @@ pub struct WorldSnapshot {
     size_z: usize,
 }
 
-impl WorldSnapshot {
-    /// Copies the inclusive area `lo..=hi` under one world read lock.
-    pub fn capture(world: &parking_lot::RwLock<World>, lo: BlockPos, hi: BlockPos) -> Self {
-        let inclusive_len = |low: i32, high: i32| -> usize {
-            (i64::from(high) - i64::from(low) + 1).max(0) as usize
-        };
-        let size_x = inclusive_len(lo.x, hi.x);
-        let size_y = inclusive_len(lo.y, hi.y);
-        let size_z = inclusive_len(lo.z, hi.z);
-        let mut blocks = Vec::with_capacity(size_x.saturating_mul(size_y).saturating_mul(size_z));
-        let mut memo: HashMap<u32, BlockKind> = HashMap::new();
-        let guard = world.read();
-        for x in lo.x..=hi.x {
-            for z in lo.z..=hi.z {
-                for y in lo.y..=hi.y {
-                    let pos = BlockPos::new(x, y, z);
-                    let kind = match guard.chunks.get_block_state(pos) {
-                        Some(state) => {
-                            let id = u32::from(state);
-                            *memo.entry(id).or_insert_with(|| classify_state(state))
-                        }
-                        None => BlockKind::Unloaded,
-                    };
-                    blocks.push(kind);
-                }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotError {
+    TooLarge { blocks: u64, maximum: u64 },
+}
+
+impl fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLarge { blocks, maximum } => {
+                write!(f, "snapshot contains {blocks} blocks; maximum is {maximum}")
             }
         }
-        drop(guard);
-        Self {
+    }
+}
+
+impl std::error::Error for SnapshotError {}
+
+fn snapshot_shape(lo: BlockPos, hi: BlockPos) -> Result<(usize, usize, usize), SnapshotError> {
+    let inclusive_len =
+        |low: i32, high: i32| -> u64 { (i64::from(high) - i64::from(low) + 1).max(0) as u64 };
+    let size_x = inclusive_len(lo.x, hi.x);
+    let size_y = inclusive_len(lo.y, hi.y);
+    let size_z = inclusive_len(lo.z, hi.z);
+    let volume = size_x
+        .checked_mul(size_y)
+        .and_then(|value| value.checked_mul(size_z))
+        .unwrap_or(u64::MAX);
+    if volume > MAX_SNAPSHOT_BLOCKS {
+        return Err(SnapshotError::TooLarge {
+            blocks: volume,
+            maximum: MAX_SNAPSHOT_BLOCKS,
+        });
+    }
+    Ok((size_y as usize, size_z as usize, volume as usize))
+}
+
+impl WorldSnapshot {
+    /// Copies the inclusive area `lo..=hi`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the area exceeds [`MAX_SNAPSHOT_BLOCKS`]. Prefer
+    /// [`Self::try_capture`] when bounds come from configuration or user input.
+    pub fn capture(world: &parking_lot::RwLock<World>, lo: BlockPos, hi: BlockPos) -> Self {
+        Self::try_capture(world, lo, hi).expect("world snapshot exceeds the safety limit")
+    }
+
+    /// Copies a bounded area without permitting an unbounded allocation.
+    ///
+    /// The world lock is released after at most 16,384 block reads so chunk
+    /// updates are not blocked for the entire capture. Classification happens
+    /// after each lock has been released.
+    pub fn try_capture(
+        world: &parking_lot::RwLock<World>,
+        lo: BlockPos,
+        hi: BlockPos,
+    ) -> Result<Self, SnapshotError> {
+        let (size_y, size_z, volume) = snapshot_shape(lo, hi)?;
+        let mut states = Vec::with_capacity(volume);
+        let yz_stride = size_y.saturating_mul(size_z);
+        for batch_start in (0..volume).step_by(SNAPSHOT_LOCK_BATCH_BLOCKS) {
+            let batch_end = batch_start
+                .saturating_add(SNAPSHOT_LOCK_BATCH_BLOCKS)
+                .min(volume);
+            let guard = world.read();
+            for index in batch_start..batch_end {
+                let x_offset = index / yz_stride;
+                let remainder = index % yz_stride;
+                let z_offset = remainder / size_y;
+                let y_offset = remainder % size_y;
+                let pos = BlockPos::new(
+                    lo.x.saturating_add(x_offset as i32),
+                    lo.y.saturating_add(y_offset as i32),
+                    lo.z.saturating_add(z_offset as i32),
+                );
+                states.push(guard.chunks.get_block_state(pos));
+            }
+        }
+
+        let mut memo: HashMap<u32, BlockKind> = HashMap::new();
+        let blocks = states
+            .into_iter()
+            .map(|state| match state {
+                Some(state) => {
+                    let id = u32::from(state);
+                    *memo.entry(id).or_insert_with(|| classify_state(state))
+                }
+                None => BlockKind::Unloaded,
+            })
+            .collect();
+
+        Ok(Self {
             blocks,
             lo,
             hi,
             size_y,
             size_z,
-        }
+        })
     }
 }
 
@@ -324,8 +397,37 @@ mod snapshot_tests {
         assert_eq!(snapshot.block(BlockPos::new(1, 64, 0)), BlockKind::Unloaded);
         assert_eq!(snapshot.block(BlockPos::new(0, 62, 0)), BlockKind::Unloaded);
     }
+
+    #[test]
+    fn excessive_snapshot_volume_is_rejected_before_allocation() {
+        assert_eq!(
+            snapshot_shape(BlockPos::new(0, 0, 0), BlockPos::new(199, 199, 199)),
+            Err(SnapshotError::TooLarge {
+                blocks: 8_000_000,
+                maximum: MAX_SNAPSHOT_BLOCKS,
+            })
+        );
+    }
 }
 
+#[cfg(test)]
+mod classification_tests {
+    use azalea::block::blocks;
+
+    use super::*;
+
+    #[test]
+    fn empty_collision_blocks_are_passable() {
+        assert_eq!(
+            classify_state(BlockState::from(blocks::ShortGrass)),
+            BlockKind::Passable
+        );
+        assert_eq!(
+            classify_state(BlockState::from(blocks::Dandelion)),
+            BlockKind::Passable
+        );
+    }
+}
 
 #[cfg(test)]
 mod snow_tests {
@@ -369,7 +471,10 @@ mod snow_tests {
         // A single layer really has *no* box, not a zero-height one, and
         // asking an empty shape for its bounds panics. That is also why
         // `classify_state` tests emptiness before it measures anything.
-        assert!(snow(1).is_collision_shape_empty(), "snow[layers=1] has a box");
+        assert!(
+            snow(1).is_collision_shape_empty(),
+            "snow[layers=1] has a box"
+        );
         for layers in 2..=8u32 {
             let got = snow(layers)
                 .collision_shape(BlockPos::new(0, 0, 0))

@@ -3,9 +3,11 @@ name = "azalea-pathfinder"
 version = "0.1.0"
 edition = "2024"
 description = "Reusable block pathfinding and navigation plugin for Azalea clients"
+license = "MIT"
+repository = "https://github.com/RaymondShell/AzaleaPathfinder"
 
 [dependencies]
-azalea = { git = "https://github.com/RaymondShell/azalea", branch = "main" }
+azalea = { git = "https://github.com/RaymondShell/azalea", rev = "c3094e4b92c8856a611d618da692b8decf315d87" }
 bevy_ecs = "0.19"
 bevy_tasks = { version = "0.19", features = ["multi_threaded"] }
 futures-lite = "2"

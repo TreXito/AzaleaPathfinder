@@ -1,3 +1,6 @@
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+
 use azalea::BlockPos;
 
 use super::graph::{TravelEdge, WorldGraph};
@@ -27,36 +30,40 @@ pub fn route(graph: &WorldGraph, from: usize, to: usize) -> Option<Vec<TravelSte
         return Some(Vec::new());
     }
 
+    let mut outgoing = vec![Vec::new(); n];
+    for (edge_idx, edge) in graph.edges.iter().enumerate() {
+        // Caller-built graphs may contain invalid edges.
+        if edge.from < n && edge.to < n {
+            outgoing[edge.from].push(edge_idx);
+        }
+    }
+
     let mut dist: Vec<Option<Cost>> = vec![None; n];
     let mut prev: Vec<Option<usize>> = vec![None; n];
-    let mut done = vec![false; n];
+    let mut open = BinaryHeap::new();
     dist[from] = Some(0);
+    open.push(Reverse((0, from)));
 
-    loop {
-        let Some(current) = (0..n)
-            .filter(|&i| !done[i] && dist[i].is_some())
-            .min_by_key(|&i| dist[i].unwrap())
-        else {
-            return None; // No reachable nodes remain.
-        };
+    while let Some(Reverse((current_dist, current))) = open.pop() {
+        if dist[current] != Some(current_dist) {
+            continue;
+        }
         if current == to {
             break;
         }
-        done[current] = true;
 
-        for (edge_idx, e) in graph.edges.iter().enumerate() {
-            // Caller-built graphs may contain invalid edges.
-            if e.from != current || e.to >= n {
-                continue;
-            }
-            let candidate = dist[current].unwrap().saturating_add(e.cost);
+        for &edge_idx in &outgoing[current] {
+            let e = &graph.edges[edge_idx];
+            let candidate = current_dist.saturating_add(e.cost);
             if dist[e.to].is_none_or(|d| candidate < d) {
                 dist[e.to] = Some(candidate);
                 prev[e.to] = Some(edge_idx);
+                open.push(Reverse((candidate, e.to)));
             }
         }
     }
 
+    dist[to]?;
     let mut steps = Vec::new();
     let mut at = to;
     while at != from {
@@ -77,6 +84,8 @@ pub fn route(graph: &WorldGraph, from: usize, to: usize) -> Option<Vec<TravelSte
 
 #[cfg(test)]
 mod tests {
+    use crate::graph::{GraphEdge, Place};
+
     use super::*;
 
     #[test]
@@ -94,5 +103,48 @@ mod tests {
         let steps = route(&graph, dwarven, deep).unwrap();
         assert_eq!(steps.len(), 1);
         assert!(matches!(steps[0].edge, TravelEdge::Warp { name: "deep" }));
+    }
+
+    #[test]
+    fn chooses_the_cheapest_route_and_ignores_invalid_edges() {
+        let places = vec![
+            Place {
+                id: "a",
+                mode: None,
+                anchor: None,
+            },
+            Place {
+                id: "b",
+                mode: None,
+                anchor: None,
+            },
+            Place {
+                id: "c",
+                mode: None,
+                anchor: None,
+            },
+        ];
+        let walk = |from, to, cost| GraphEdge {
+            from,
+            to,
+            edge: TravelEdge::Walk,
+            cost,
+        };
+        let graph = WorldGraph {
+            places,
+            edges: vec![
+                walk(0, 2, 50),
+                walk(0, 1, 10),
+                walk(1, 2, 10),
+                walk(99, 2, 1),
+                walk(0, 99, 1),
+            ],
+        };
+
+        let steps = route(&graph, 0, 2).unwrap();
+        assert_eq!(
+            steps.iter().map(|step| step.to_id).collect::<Vec<_>>(),
+            ["b", "c"]
+        );
     }
 }

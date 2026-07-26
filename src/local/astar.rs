@@ -42,6 +42,13 @@ fn lava_safe_to_finish(risk: Cost, ctx: &MoveContext) -> bool {
     matches!(ctx.lava_policy, super::moves::LavaPolicy::Penalized) || risk == 0
 }
 
+fn water_risk(pos: BlockPos, world: &dyn WorldView, ctx: &MoveContext) -> u8 {
+    u8::from(
+        matches!(ctx.water_policy, super::moves::WaterPolicy::Forbidden)
+            && world.block(pos) == super::world::BlockKind::Water,
+    )
+}
+
 fn terrain_penalty(pos: BlockPos, world: &dyn WorldView, ctx: &MoveContext) -> Cost {
     let direct_lava = if matches!(ctx.lava_policy, super::moves::LavaPolicy::Penalized) {
         super::moves::lava_penalty(pos, world, ctx.lava_penalty)
@@ -133,8 +140,8 @@ struct NodeData {
     reached_by: MoveKind,
 }
 
-/// Lower bound for A*: octile horizontal cost and vertical cost are combined
-/// with `max` because one move can advance on both axes.
+/// Lower bound for A*. Horizontal and vertical estimates are combined with
+/// `max` because one move can advance on both axes.
 fn heuristic(pos: BlockPos, goal: BlockPos, ctx: &MoveContext) -> Cost {
     // Applying tolerance to each axis is looser than Manhattan tolerance, so
     // the estimate stays admissible.
@@ -142,31 +149,43 @@ fn heuristic(pos: BlockPos, goal: BlockPos, ctx: &MoveContext) -> Cost {
     let dx = pos.x.abs_diff(goal.x).saturating_sub(tolerance);
     let dz = pos.z.abs_diff(goal.z).saturating_sub(tolerance);
     let dy = pos.y.abs_diff(goal.y).saturating_sub(tolerance);
-    // Jump, step, and fall can also make horizontal progress.
-    let cardinal = ctx
+    // Every built-in move that can make horizontal progress participates here.
+    // Using Chebyshev distance keeps diagonal parkour admissible even when a
+    // caller configures unusually cheap movement costs.
+    let horizontal_per_axis = ctx
         .costs
         .cardinal_walk
+        .min(ctx.costs.diagonal_walk)
         .min(ctx.costs.step)
         .min(ctx.costs.jump)
-        .min(ctx.costs.fall_base.saturating_add(ctx.costs.fall_per_block));
-    let diagonal = ctx.costs.diagonal_walk.min(cardinal.saturating_mul(2));
-    let horiz = diagonal
-        .saturating_mul(dx.min(dz))
-        .saturating_add(cardinal.saturating_mul(dx.max(dz) - dx.min(dz)));
+        .min(ctx.costs.fall_base.saturating_add(ctx.costs.fall_per_block))
+        .min(ctx.costs.parkour_per_block)
+        .min(ctx.costs.swim)
+        .min(ctx.costs.swim_exit)
+        .min(ctx.costs.climb);
+    let horiz = horizontal_per_axis.saturating_mul(dx.max(dz));
     let vert = if pos.y < goal.y {
-        ctx.costs.step.min(ctx.costs.jump).saturating_mul(dy)
+        ctx.costs
+            .step
+            .min(ctx.costs.jump)
+            .min(ctx.costs.climb)
+            .min(ctx.costs.swim)
+            .min(ctx.costs.swim_exit)
+            .saturating_mul(dy)
     } else {
-        let cheapest_fall = ctx.costs.fall_base.saturating_add(ctx.costs.fall_per_block);
-        let fall_bound = cheapest_fall.saturating_mul(dy.div_ceil(ctx.max_fall.max(1) as u32));
-        let stair_bound = ctx.costs.step.saturating_mul(dy);
-        fall_bound.min(stair_bound)
+        ctx.costs
+            .step
+            .min(ctx.costs.climb)
+            .min(ctx.costs.swim)
+            // Descending parkour pays this per dropped block but no fall base.
+            .min(ctx.costs.fall_per_block)
+            .saturating_mul(dy)
     };
     horiz.max(vert)
 }
 
 /// Finds a path to within `ctx.goal_tolerance` Manhattan distance of `goal`.
 /// Returns an error instead of a partial path when the goal cannot be reached.
-#[allow(dead_code)]
 pub fn find_path(
     world: &dyn WorldView,
     start: BlockPos,
@@ -174,107 +193,7 @@ pub fn find_path(
     moves: &[Box<dyn Move>],
     ctx: &MoveContext,
 ) -> Result<Path, PathError> {
-    let use_heuristic = moves
-        .iter()
-        .all(|movement| movement.supports_builtin_heuristic());
-    let h = |p: BlockPos| -> Cost {
-        if use_heuristic {
-            heuristic(p, goal, ctx)
-        } else {
-            0
-        }
-    };
-    let manhattan = |p: BlockPos| -> u64 {
-        u64::from(p.x.abs_diff(goal.x))
-            + u64::from(p.y.abs_diff(goal.y))
-            + u64::from(p.z.abs_diff(goal.z))
-    };
-    let goal_tolerance = u64::from(ctx.goal_tolerance.max(0) as u32);
-    let key = |p: BlockPos| -> Key { (p.x, p.y, p.z) };
-
-    let mut nodes: HashMap<Key, NodeData> = HashMap::new();
-    // Reverse turns the max-heap into a min-heap ordered by f-score.
-    let mut open: BinaryHeap<Reverse<(Cost, Cost, Key)>> = BinaryHeap::new();
-
-    nodes.insert(
-        key(start),
-        NodeData {
-            g: 0,
-            parent: None,
-            reached_by: MoveKind::Start,
-        },
-    );
-    open.push(Reverse((
-        h(start),
-        tie_break(start, ctx.path_seed),
-        key(start),
-    )));
-
-    let mut expansions = 0usize;
-    let mut scratch: Vec<Edge> = Vec::new();
-    let mut terrain_costs: HashMap<Key, Cost> = HashMap::new();
-    let mut lava_risks: HashMap<Key, Cost> = HashMap::new();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ctx.time_budget_ms);
-
-    while let Some(Reverse((f, _, k))) = open.pop() {
-        let pos = BlockPos::new(k.0, k.1, k.2);
-        let g = nodes[&k].g;
-        if f > g.saturating_add(h(pos)) {
-            continue; // stale heap entry superseded by a cheaper route
-        }
-
-        let current_lava_risk = cached_lava_risk(pos, world, ctx, &mut lava_risks);
-        if manhattan(pos) <= goal_tolerance && lava_safe_to_finish(current_lava_risk, ctx) {
-            return Ok(reconstruct(&nodes, pos, g));
-        }
-
-        expansions += 1;
-        if expansions > ctx.max_expansions {
-            return Err(PathError::SearchBudgetExhausted);
-        }
-        // Check time occasionally to avoid paying for a clock read per node.
-        if expansions.is_multiple_of(512) && std::time::Instant::now() > deadline {
-            return Err(PathError::SearchBudgetExhausted);
-        }
-
-        scratch.clear();
-        for m in moves {
-            m.candidates(pos, world, ctx, &mut scratch);
-        }
-        for edge in scratch.drain(..) {
-            if !lava_edge_allowed(pos, edge.to, world, ctx, &mut lava_risks) {
-                continue;
-            }
-            let ek = key(edge.to);
-            let base_g = g.saturating_add(edge.cost);
-            // Skip the terrain scan if the base cost cannot improve this node.
-            if nodes.get(&ek).is_some_and(|nd| base_g >= nd.g) {
-                continue;
-            }
-            let terrain = *terrain_costs
-                .entry(ek)
-                .or_insert_with(|| terrain_penalty(edge.to, world, ctx));
-            let ng = base_g.saturating_add(terrain);
-            let better = nodes.get(&ek).is_none_or(|nd| ng < nd.g);
-            if better {
-                nodes.insert(
-                    ek,
-                    NodeData {
-                        g: ng,
-                        parent: Some(pos),
-                        reached_by: edge.kind,
-                    },
-                );
-                open.push(Reverse((
-                    ng.saturating_add(h(edge.to)),
-                    tie_break(edge.to, ctx.path_seed),
-                    ek,
-                )));
-            }
-        }
-    }
-
-    Err(PathError::NoPath)
+    search(world, start, goal, moves, ctx, SearchMode::Strict).map(|(path, _)| path)
 }
 
 /// Finds a complete path when possible, or the best reachable partial path.
@@ -287,6 +206,27 @@ pub fn find_path_best_effort(
     moves: &[Box<dyn Move>],
     ctx: &MoveContext,
 ) -> (Path, bool) {
+    match search(world, start, goal, moves, ctx, SearchMode::BestEffort) {
+        Ok(result) => result,
+        Err(_) => unreachable!("best-effort search always returns a partial path"),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SearchMode {
+    Strict,
+    BestEffort,
+}
+
+/// Shared A* implementation for strict and partial-path callers.
+fn search(
+    world: &dyn WorldView,
+    start: BlockPos,
+    goal: BlockPos,
+    moves: &[Box<dyn Move>],
+    ctx: &MoveContext,
+    mode: SearchMode,
+) -> Result<(Path, bool), PathError> {
     let use_heuristic = moves
         .iter()
         .all(|movement| movement.supports_builtin_heuristic());
@@ -322,15 +262,18 @@ pub fn find_path_best_effort(
     )));
 
     let mut lava_risks: HashMap<Key, Cost> = HashMap::new();
-    // When starting near lava, escaping it takes priority over goal distance.
-    let mut best_risk = cached_lava_risk(start, world, ctx, &mut lava_risks);
+    // When starting in a forbidden hazard, escaping it takes priority over
+    // goal distance. Lava remains first because it is immediately damaging.
+    let mut best_lava_risk = cached_lava_risk(start, world, ctx, &mut lava_risks);
+    let mut best_water_risk = water_risk(start, world, ctx);
     let mut best_dist = manhattan(start);
     let mut best = (start, 0u32);
 
     let mut expansions = 0usize;
     let mut scratch: Vec<Edge> = Vec::new();
     let mut terrain_costs: HashMap<Key, Cost> = HashMap::new();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ctx.time_budget_ms);
+    let deadline =
+        std::time::Instant::now().checked_add(std::time::Duration::from_millis(ctx.time_budget_ms));
 
     while let Some(Reverse((f, _, k))) = open.pop() {
         let pos = BlockPos::new(k.0, k.1, k.2);
@@ -339,20 +282,37 @@ pub fn find_path_best_effort(
             continue;
         }
         let current_lava_risk = cached_lava_risk(pos, world, ctx, &mut lava_risks);
-        if manhattan(pos) <= goal_tolerance && lava_safe_to_finish(current_lava_risk, ctx) {
-            return (reconstruct(&nodes, pos, g), true);
+        let current_water_risk = water_risk(pos, world, ctx);
+        if manhattan(pos) <= goal_tolerance
+            && lava_safe_to_finish(current_lava_risk, ctx)
+            && current_water_risk == 0
+        {
+            return Ok((reconstruct(&nodes, pos, g), true));
         }
         let md = manhattan(pos);
-        if current_lava_risk < best_risk || (current_lava_risk == best_risk && md < best_dist) {
-            best_risk = current_lava_risk;
+        if current_lava_risk < best_lava_risk
+            || (current_lava_risk == best_lava_risk
+                && (current_water_risk < best_water_risk
+                    || (current_water_risk == best_water_risk && md < best_dist)))
+        {
+            best_lava_risk = current_lava_risk;
+            best_water_risk = current_water_risk;
             best_dist = md;
             best = (pos, g);
         }
         expansions += 1;
         if expansions > ctx.max_expansions {
+            if mode == SearchMode::Strict {
+                return Err(PathError::SearchBudgetExhausted);
+            }
             break;
         }
-        if expansions.is_multiple_of(512) && std::time::Instant::now() > deadline {
+        if (expansions == 1 || expansions.is_multiple_of(512))
+            && deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            if mode == SearchMode::Strict {
+                return Err(PathError::SearchBudgetExhausted);
+            }
             break;
         }
         scratch.clear();
@@ -391,8 +351,11 @@ pub fn find_path_best_effort(
         }
     }
 
+    if mode == SearchMode::Strict {
+        return Err(PathError::NoPath);
+    }
     // A partial path lets the caller move, load more chunks, and plan again.
-    (reconstruct(&nodes, best.0, best.1), false)
+    Ok((reconstruct(&nodes, best.0, best.1), false))
 }
 
 fn reconstruct(nodes: &HashMap<Key, NodeData>, end: BlockPos, total_cost: Cost) -> Path {
@@ -704,7 +667,12 @@ mod tests {
             &ctx(),
         )
         .unwrap();
-        assert!(straight.nodes.iter().any(|n| n.pos == BlockPos::new(3, 64, 0)));
+        assert!(
+            straight
+                .nodes
+                .iter()
+                .any(|n| n.pos == BlockPos::new(3, 64, 0))
+        );
 
         let mut avoid = std::collections::HashMap::new();
         avoid.insert(BlockPos::new(3, 64, 0), 800);
@@ -1019,6 +987,32 @@ mod tests {
     }
 
     #[test]
+    fn best_effort_prioritizes_escaping_forbidden_water() {
+        let mut grid = Grid::new();
+        grid.floor(-2..=8, -1..=1, 63);
+        grid.floor(3..=5, -1..=1, 59);
+        grid.pool(3..=5, -1..=1, 60..=63);
+        let start = BlockPos::new(4, 60, 0);
+        // Swimming west is initially closer, but the goal is outside the
+        // captured floor. The safe partial result must escape onto either bank.
+        let goal = BlockPos::new(-20, 60, 0);
+
+        let (path, reached) = find_path_best_effort(&grid, start, goal, &default_moves(), &ctx());
+
+        assert!(!reached);
+        assert_eq!(grid.block(start), BlockKind::Water);
+        assert_ne!(
+            grid.block(path.nodes.last().unwrap().pos),
+            BlockKind::Water,
+            "partial route stayed in forbidden water: {:?}",
+            path.nodes
+                .iter()
+                .map(|node| (node.pos, node.reached_by))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn best_effort_returns_partial_toward_unreachable_goal() {
         // The floor ends before the goal, like an unloaded chunk boundary.
         let mut grid = Grid::new();
@@ -1172,6 +1166,34 @@ mod tests {
         .expect("refused to cross uneven ground with no alternative");
         // Within the goal tolerance, which is what "reached" means here.
         let end = path.nodes.last().unwrap().pos;
-        assert!(dist(end, BlockPos::new(8, 64, 0)) <= 1, "stopped at {end:?}");
+        assert!(
+            dist(end, BlockPos::new(8, 64, 0)) <= 1,
+            "stopped at {end:?}"
+        );
+    }
+
+    #[test]
+    fn extreme_time_budgets_are_handled_without_panicking() {
+        let mut grid = Grid::new();
+        grid.floor(-2..=4, -2..=2, 63);
+        let start = BlockPos::new(0, 64, 0);
+        let goal = BlockPos::new(4, 64, 0);
+
+        let zero_budget = MoveContext {
+            goal_tolerance: 0,
+            time_budget_ms: 0,
+            ..ctx()
+        };
+        assert!(matches!(
+            find_path(&grid, start, goal, &default_moves(), &zero_budget),
+            Err(PathError::SearchBudgetExhausted)
+        ));
+
+        let unlimited_clock = MoveContext {
+            goal_tolerance: 0,
+            time_budget_ms: u64::MAX,
+            ..ctx()
+        };
+        assert!(find_path(&grid, start, goal, &default_moves(), &unlimited_clock).is_ok());
     }
 }
