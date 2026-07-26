@@ -15,15 +15,16 @@ It provides:
 
 ```toml
 [dependencies]
-azalea = { git = "https://github.com/RaymondShell/azalea", rev = "c3094e4b92c8856a611d618da692b8decf315d87" }
-azalea-pathfinder = { git = "https://github.com/RaymondShell/AzaleaPathfinder", rev = "<release-commit>" }
+azalea = { git = "https://github.com/RaymondShell/azalea", branch = "main" }
+azalea-pathfinder = { git = "https://github.com/RaymondShell/AzaleaPathfinder", branch = "master" }
 bevy_ecs = "0.19"
 ```
 
 `bevy_ecs` must match the version used by Azalea. Azalea's NBT dependency uses
 nightly-only portable SIMD, so this repository pins a known-good nightly in
 `rust-toolchain.toml`. Use a release build for live navigation; large searches
-are noticeably slower in debug builds.
+are noticeably slower in debug builds. Run `cargo update -p azalea` before
+building to refresh the tracked Azalea branch.
 
 ## Quick start
 
@@ -176,12 +177,13 @@ optimal.
 - The bundled SkyBlock graph is a small warp-based starting map, not a complete
   map of every island and transition.
 - Planning only knows about loaded blocks included in the snapshot.
-- Water movement exists, but it is forbidden by default while the pinned
+- Water movement exists, but it is forbidden by default while the current
   Azalea water physics disagrees with the target server simulation.
 
 ## Testing
 
 ```sh
+cargo update -p azalea
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```

@@ -17,6 +17,7 @@ jobs:
           toolchain: nightly-2026-07-01
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - run: cargo update -p azalea
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
@@ -32,6 +33,7 @@ jobs:
       - uses: taiki-e/install-action@f1b61bf3a1373bccc1ebdc11506122709bd40dee # cargo-audit
         with:
           tool: cargo-audit@0.22.2
+      - run: cargo update -p azalea
       # RustSec currently has no patched rsa release. SECURITY.md documents the
       # threat model and requires this sole exemption to be removed when fixed.
       - run: cargo +stable audit --ignore RUSTSEC-2023-0071
