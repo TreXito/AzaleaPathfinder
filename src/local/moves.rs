@@ -107,6 +107,11 @@ pub struct MoveContext {
     /// legal move back off it and stood on top. Falls are priced by the damage
     /// they do (see [`Self::fall_damage_penalty`]) and clamped to what the bot
     /// can survive, so "how far may I drop" is a cost question, not a ban.
+    ///
+    /// Candidate generation sanitizes this to `0..=127`: non-positive values
+    /// disable drops, while larger values use 127. The upper bound is the
+    /// largest downward distance shared by the signed parkour encoding and a
+    /// bounded amount of work per movement rule.
     pub max_fall: i32,
     /// Extra cost per half-heart of fall damage a drop would cause.
     ///
@@ -200,6 +205,12 @@ pub struct Edge {
 pub trait Move: Send + Sync {
     /// Push every position reachable from `from` in one application of
     /// this move onto `out`.
+    ///
+    /// Implementations are trusted cooperative extensions: one call must
+    /// terminate promptly and return no more than
+    /// [`crate::local::astar::MAX_CANDIDATES_PER_MOVE`] candidates. The search
+    /// rejects oversized output, but cannot preempt code while this method is
+    /// running.
     fn candidates(
         &self,
         from: BlockPos,
@@ -212,6 +223,19 @@ pub trait Move: Send + Sync {
     /// assumptions. Return `false` for long-range or unusually cheap moves.
     fn supports_builtin_heuristic(&self) -> bool {
         false
+    }
+
+    /// Generator-authored metadata for adaptive costing and execution
+    /// telemetry. Custom moves may return `None`; they remain fully supported
+    /// but are neither learned nor assigned a built-in heuristic.
+    fn metadata(
+        &self,
+        _from: BlockPos,
+        _edge: &Edge,
+        _world: &dyn WorldView,
+        _ctx: &MoveContext,
+    ) -> Option<crate::planning::MotionMetadata> {
+        None
     }
 }
 
@@ -308,7 +332,13 @@ pub fn wall_proximity_penalty(pos: BlockPos, world: &dyn WorldView, per_wall: Co
         }
     }
     // walls * per_wall, scaled by (room capped at OPEN_ROOM) / OPEN_ROOM.
-    (per_wall * walls * room.min(OPEN_ROOM)) / OPEN_ROOM
+    // Widen before multiplying so division is applied to the mathematical
+    // product rather than to an already-saturated u32 intermediate.
+    let scaled = u64::from(per_wall)
+        .saturating_mul(u64::from(walls))
+        .saturating_mul(u64::from(room.min(OPEN_ROOM)))
+        / u64::from(OPEN_ROOM);
+    scaled.min(u64::from(Cost::MAX)) as Cost
 }
 
 /// Adds a flat cost when the player's feet, head, or floor touches lava.
@@ -458,6 +488,25 @@ impl Move for WalkMove {
     fn supports_builtin_heuristic(&self) -> bool {
         true
     }
+
+    fn metadata(
+        &self,
+        from: BlockPos,
+        edge: &Edge,
+        world: &dyn WorldView,
+        ctx: &MoveContext,
+    ) -> Option<crate::planning::MotionMetadata> {
+        let primitive = if from.y != edge.to.y {
+            crate::PrimitiveId::STEP
+        } else if from.x != edge.to.x && from.z != edge.to.z {
+            crate::PrimitiveId::WALK_DIAGONAL
+        } else {
+            crate::PrimitiveId::WALK_CARDINAL
+        };
+        Some(crate::planning::metadata_from_generated_edge(
+            primitive, from, edge.to, edge.kind, world, ctx, edge.cost,
+        ))
+    }
 }
 
 /// Jump up a single block step in a cardinal direction.
@@ -508,6 +557,24 @@ impl Move for JumpMove {
 
     fn supports_builtin_heuristic(&self) -> bool {
         true
+    }
+
+    fn metadata(
+        &self,
+        from: BlockPos,
+        edge: &Edge,
+        world: &dyn WorldView,
+        ctx: &MoveContext,
+    ) -> Option<crate::planning::MotionMetadata> {
+        Some(crate::planning::metadata_from_generated_edge(
+            crate::PrimitiveId::JUMP,
+            from,
+            edge.to,
+            edge.kind,
+            world,
+            ctx,
+            edge.cost,
+        ))
     }
 }
 
@@ -614,6 +681,24 @@ impl Move for ClimbMove {
 
     fn supports_builtin_heuristic(&self) -> bool {
         true
+    }
+
+    fn metadata(
+        &self,
+        from: BlockPos,
+        edge: &Edge,
+        world: &dyn WorldView,
+        ctx: &MoveContext,
+    ) -> Option<crate::planning::MotionMetadata> {
+        Some(crate::planning::metadata_from_generated_edge(
+            crate::PrimitiveId::CLIMB,
+            from,
+            edge.to,
+            edge.kind,
+            world,
+            ctx,
+            edge.cost,
+        ))
     }
 }
 
@@ -777,7 +862,7 @@ impl Move for ParkourMove {
             if distance > MAX_FLAT_JUMP {
                 continue;
             }
-            for drop in 1..=ctx.max_fall {
+            for drop in 1..=generated_drop_limit(ctx.max_fall) {
                 let to = offset(from, ox, -drop, oz);
                 if !dry_standable(world, to) {
                     // Keep descending through clear air until the first viable
@@ -810,11 +895,16 @@ impl Move for ParkourMove {
                 } else {
                     (drop - SAFE_FALL).max(0) as Cost
                 };
+                let Ok(encoded_rise) = i8::try_from(-drop) else {
+                    // `generated_drop_limit` makes this unreachable, but keep
+                    // malformed future bounds from silently wrapping an edge.
+                    break;
+                };
                 out.push(Edge {
                     to,
                     kind: MoveKind::Parkour {
                         blocks: blocks as u8,
-                        rise: -drop as i8,
+                        rise: encoded_rise,
                     },
                     cost: ctx
                         .costs
@@ -830,6 +920,24 @@ impl Move for ParkourMove {
 
     fn supports_builtin_heuristic(&self) -> bool {
         true
+    }
+
+    fn metadata(
+        &self,
+        from: BlockPos,
+        edge: &Edge,
+        world: &dyn WorldView,
+        ctx: &MoveContext,
+    ) -> Option<crate::planning::MotionMetadata> {
+        Some(crate::planning::metadata_from_generated_edge(
+            crate::PrimitiveId::PARKOUR,
+            from,
+            edge.to,
+            edge.kind,
+            world,
+            ctx,
+            edge.cost,
+        ))
     }
 }
 
@@ -1045,10 +1153,40 @@ impl Move for SwimMove {
     fn supports_builtin_heuristic(&self) -> bool {
         true
     }
+
+    fn metadata(
+        &self,
+        from: BlockPos,
+        edge: &Edge,
+        world: &dyn WorldView,
+        ctx: &MoveContext,
+    ) -> Option<crate::planning::MotionMetadata> {
+        let primitive = if in_water(world, from) && !in_water(world, edge.to) && edge.to.y > from.y
+        {
+            crate::PrimitiveId::SWIM_EXIT
+        } else {
+            crate::PrimitiveId::SWIM
+        };
+        Some(crate::planning::metadata_from_generated_edge(
+            primitive, from, edge.to, edge.kind, world, ctx, edge.cost,
+        ))
+    }
 }
 
 /// The tallest drop vanilla charges nothing for.
 pub const SAFE_FALL: i32 = 3;
+
+/// Largest drop inspected by a built-in movement rule.
+///
+/// Descending parkour stores its signed rise in an `i8`, so 127 is the largest
+/// symmetric downward magnitude it can represent. Sharing this bound with
+/// ordinary falls also prevents a hostile public [`MoveContext::max_fall`]
+/// value from turning one candidate call into billions of world reads.
+pub const MAX_GENERATED_DROP: i32 = i8::MAX as i32;
+
+fn generated_drop_limit(configured: i32) -> i32 {
+    configured.clamp(0, MAX_GENERATED_DROP)
+}
 
 /// Walk off an edge and drop up to `ctx.max_fall` blocks.
 ///
@@ -1070,7 +1208,7 @@ impl Move for FallMove {
                 continue;
             }
             // Stop at the first valid landing or obstruction.
-            for drop in 1..=ctx.max_fall {
+            for drop in 1..=generated_drop_limit(ctx.max_fall) {
                 let feet = offset(step, 0, -drop, 0);
                 // A pool is a landing vanilla is happy with, but dropping into
                 // one is still entering water, and under `Forbidden` that is
@@ -1114,11 +1252,234 @@ impl Move for FallMove {
     fn supports_builtin_heuristic(&self) -> bool {
         true
     }
+
+    fn metadata(
+        &self,
+        from: BlockPos,
+        edge: &Edge,
+        world: &dyn WorldView,
+        ctx: &MoveContext,
+    ) -> Option<crate::planning::MotionMetadata> {
+        Some(crate::planning::metadata_from_generated_edge(
+            crate::PrimitiveId::FALL,
+            from,
+            edge.to,
+            edge.kind,
+            world,
+            ctx,
+            edge.cost,
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+
+    struct MetadataGrid(HashMap<(i32, i32, i32), BlockKind>);
+
+    impl WorldView for MetadataGrid {
+        fn block(&self, pos: BlockPos) -> BlockKind {
+            self.0
+                .get(&(pos.x, pos.y, pos.z))
+                .copied()
+                .unwrap_or(BlockKind::Air)
+        }
+    }
+
+    fn generated_metadata(
+        movement: &dyn Move,
+        from: BlockPos,
+        to: BlockPos,
+        world: &dyn WorldView,
+        context: &MoveContext,
+    ) -> (Cost, crate::planning::MotionMetadata) {
+        let mut edges = Vec::new();
+        movement.candidates(from, world, context, &mut edges);
+        let edge = edges
+            .iter()
+            .find(|edge| edge.to == to)
+            .unwrap_or_else(|| panic!("no generated edge from {from:?} to {to:?}"));
+        let metadata = movement
+            .metadata(from, edge, world, context)
+            .expect("built-in edge omitted metadata");
+        assert_eq!(
+            metadata.predicted.total(),
+            edge.cost,
+            "metadata diverged for {:?} from {from:?} to {to:?}",
+            edge.kind
+        );
+        (edge.cost, metadata)
+    }
+
+    #[test]
+    fn representative_generated_edges_preserve_exact_cost_components() {
+        let context = MoveContext::default();
+
+        let step_from = BlockPos::new(0, 64, 0);
+        let step_to = BlockPos::new(1, 65, 0);
+        let step_world = MetadataGrid(
+            [
+                ((0, 64, 0), BlockKind::Step(8)),
+                ((1, 64, 0), BlockKind::Solid),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let (cost, metadata) =
+            generated_metadata(&WalkMove, step_from, step_to, &step_world, &context);
+        assert_eq!(cost, context.costs.step);
+        assert_eq!(metadata.primitive, crate::PrimitiveId::STEP);
+
+        let jump_from = BlockPos::new(0, 64, 0);
+        let jump_to = BlockPos::new(1, 65, 0);
+        let jump_world = MetadataGrid([((1, 64, 0), BlockKind::Solid)].into_iter().collect());
+        let (cost, metadata) =
+            generated_metadata(&JumpMove, jump_from, jump_to, &jump_world, &context);
+        assert_eq!(cost, context.costs.jump);
+        assert_eq!(metadata.primitive, crate::PrimitiveId::JUMP);
+
+        let climb_from = BlockPos::new(0, 64, 0);
+        let climb_to = BlockPos::new(1, 65, 0);
+        let climb_world = MetadataGrid([((1, 65, 0), BlockKind::Climbable)].into_iter().collect());
+        let (cost, metadata) =
+            generated_metadata(&ClimbMove, climb_from, climb_to, &climb_world, &context);
+        assert_eq!(
+            cost,
+            context
+                .costs
+                .climb
+                .saturating_mul(2)
+                .saturating_add(context.costs.jump)
+        );
+        assert_eq!(metadata.predicted.time, cost);
+        assert_eq!(metadata.predicted_ticks, 41);
+        assert_eq!(metadata.features.horizontal_blocks, 1);
+
+        let rung_from = BlockPos::new(0, 64, 0);
+        let rung_to = BlockPos::new(0, 65, 0);
+        let rung_world = MetadataGrid(
+            [
+                ((0, 64, 0), BlockKind::Climbable),
+                ((0, 65, 0), BlockKind::Climbable),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let (cost, metadata) =
+            generated_metadata(&ClimbMove, rung_from, rung_to, &rung_world, &context);
+        assert_eq!(cost, context.costs.climb);
+        assert_eq!(metadata.predicted_ticks, 15);
+        assert_eq!(metadata.features.horizontal_blocks, 0);
+
+        let parkour_from = BlockPos::new(0, 64, 0);
+        let parkour_to = BlockPos::new(3, 64, 0);
+        let parkour_world = MetadataGrid(
+            [
+                ((-1, 63, 0), BlockKind::Solid),
+                ((0, 63, 0), BlockKind::Solid),
+                ((3, 63, 0), BlockKind::Solid),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let (cost, metadata) = generated_metadata(
+            &ParkourMove,
+            parkour_from,
+            parkour_to,
+            &parkour_world,
+            &context,
+        );
+        assert_eq!(cost, context.costs.parkour_per_block.saturating_mul(3));
+        assert_eq!(metadata.primitive, crate::PrimitiveId::PARKOUR);
+    }
+
+    #[test]
+    fn swim_toll_is_fixed_safety_under_both_policies() {
+        let from = BlockPos::new(0, 64, 0);
+        let to = BlockPos::new(1, 64, 0);
+        let world = MetadataGrid(
+            [
+                ((0, 64, 0), BlockKind::Water),
+                ((1, 64, 0), BlockKind::Water),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        for policy in [WaterPolicy::Forbidden, WaterPolicy::Penalized] {
+            let context = MoveContext {
+                water_policy: policy,
+                water_penalty: 777,
+                ..MoveContext::default()
+            };
+            let (cost, metadata) = generated_metadata(&SwimMove, from, to, &world, &context);
+            assert_eq!(
+                cost,
+                context.costs.swim.saturating_add(context.water_penalty)
+            );
+            assert_eq!(metadata.predicted.time, context.costs.swim);
+            assert_eq!(metadata.predicted.safety, context.water_penalty);
+            assert_eq!(metadata.predicted.damage, 0);
+            assert_eq!(
+                metadata.features.flags & crate::MoveFeatures::FLAG_WATER_ENTRY,
+                0
+            );
+        }
+
+        let context = MoveContext {
+            water_policy: WaterPolicy::Penalized,
+            water_penalty: 777,
+            ..MoveContext::default()
+        };
+        let entry_from = BlockPos::new(-1, 64, 0);
+        let entry_world = MetadataGrid([((0, 64, 0), BlockKind::Water)].into_iter().collect());
+        let (entry_cost, entry) =
+            generated_metadata(&SwimMove, entry_from, from, &entry_world, &context);
+        let (stroke_cost, stroke) = generated_metadata(&SwimMove, from, to, &world, &context);
+        assert_eq!(entry_cost, stroke_cost);
+        assert_eq!(entry.predicted, stroke.predicted);
+        assert_ne!(
+            entry.features.flags & crate::MoveFeatures::FLAG_WATER_ENTRY,
+            0
+        );
+        assert_eq!(
+            stroke.features.flags & crate::MoveFeatures::FLAG_WATER_ENTRY,
+            0
+        );
+        assert_ne!(entry.features, stroke.features);
+    }
+
+    #[test]
+    fn fall_metadata_matches_dry_damage_and_zeroes_water_landing_damage() {
+        let from = BlockPos::new(0, 70, 0);
+        let to = BlockPos::new(1, 65, 0);
+        let context = MoveContext {
+            water_policy: WaterPolicy::Penalized,
+            ..MoveContext::default()
+        };
+
+        let dry_world = MetadataGrid([((1, 64, 0), BlockKind::Solid)].into_iter().collect());
+        let (dry_cost, dry) = generated_metadata(&FallMove, from, to, &dry_world, &context);
+        assert_eq!(
+            dry.predicted.damage,
+            context.fall_damage_penalty.saturating_mul(2)
+        );
+        assert_eq!(dry.predicted.total(), dry_cost);
+
+        let water_world = MetadataGrid([((1, 65, 0), BlockKind::Water)].into_iter().collect());
+        let (water_cost, water) = generated_metadata(&FallMove, from, to, &water_world, &context);
+        assert_eq!(water.predicted.damage, 0);
+        assert_eq!(
+            water_cost,
+            context
+                .costs
+                .fall_base
+                .saturating_add(context.costs.fall_per_block.saturating_mul(5))
+        );
+        assert_eq!(water.predicted.total(), water_cost);
+    }
 
     #[test]
     fn forbidden_policy_only_allows_risk_reducing_escape_steps() {
@@ -1219,6 +1580,94 @@ mod tests {
         );
     }
 
+    #[test]
+    fn extreme_max_fall_is_bounded_and_parkour_rise_never_wraps() {
+        let from = BlockPos::new(0, 200, 0);
+        let parkour_to = BlockPos::new(2, 200 - MAX_GENERATED_DROP, 0);
+        let parkour_world = MetadataGrid(
+            [
+                ((0, 199, 0), BlockKind::Solid),
+                ((2, parkour_to.y - 1, 0), BlockKind::Solid),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let fall_to = BlockPos::new(1, 200 - MAX_GENERATED_DROP, 0);
+        let fall_world = MetadataGrid(
+            [
+                ((0, 199, 0), BlockKind::Solid),
+                ((1, fall_to.y - 1, 0), BlockKind::Solid),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        assert_eq!(generated_drop_limit(128), MAX_GENERATED_DROP);
+        assert_eq!(generated_drop_limit(i32::MAX), MAX_GENERATED_DROP);
+        for max_fall in [128, i32::MAX] {
+            let context = MoveContext {
+                max_fall,
+                ..MoveContext::default()
+            };
+
+            let mut parkour = Vec::new();
+            ParkourMove.candidates(from, &parkour_world, &context, &mut parkour);
+            let edge = parkour
+                .iter()
+                .find(|edge| edge.to == parkour_to)
+                .expect("representable deepest parkour landing was omitted");
+            let MoveKind::Parkour { rise, .. } = edge.kind else {
+                panic!("deep parkour landing used the wrong move kind");
+            };
+            assert_eq!(rise, -127);
+
+            let mut falls = Vec::new();
+            FallMove.candidates(from, &fall_world, &context, &mut falls);
+            assert!(
+                falls.iter().any(|edge| edge.to == fall_to),
+                "representable deepest fall landing was omitted"
+            );
+            assert!(
+                parkour
+                    .iter()
+                    .chain(&falls)
+                    .all(|edge| { from.y.saturating_sub(edge.to.y) <= MAX_GENERATED_DROP })
+            );
+        }
+
+        // A landing one block past the encoding/work cap must not be emitted,
+        // even when the caller asks for that distance or an effectively
+        // unbounded one.
+        let too_deep_parkour = BlockPos::new(2, from.y - (MAX_GENERATED_DROP + 1), 0);
+        let too_deep_fall = BlockPos::new(1, from.y - (MAX_GENERATED_DROP + 1), 0);
+        let parkour_world = MetadataGrid(
+            [
+                ((0, 199, 0), BlockKind::Solid),
+                ((2, too_deep_parkour.y - 1, 0), BlockKind::Solid),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let fall_world = MetadataGrid(
+            [
+                ((0, 199, 0), BlockKind::Solid),
+                ((1, too_deep_fall.y - 1, 0), BlockKind::Solid),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let context = MoveContext {
+            max_fall: i32::MAX,
+            ..MoveContext::default()
+        };
+        let mut parkour = Vec::new();
+        ParkourMove.candidates(from, &parkour_world, &context, &mut parkour);
+        assert!(!parkour.iter().any(|edge| edge.to == too_deep_parkour));
+        let mut falls = Vec::new();
+        FallMove.candidates(from, &fall_world, &context, &mut falls);
+        assert!(!falls.iter().any(|edge| edge.to == too_deep_fall));
+    }
+
     /// The wall toll scales with room: a corridor is charged far less than an
     /// open plaza, because in a corridor there is no way to be more central.
     #[test]
@@ -1264,6 +1713,11 @@ mod tests {
         assert!(
             in_open > in_corridor,
             "open plaza ({in_open}) should be charged more than a corridor ({in_corridor})"
+        );
+        assert_eq!(
+            wall_proximity_penalty(here, &plaza, Cost::MAX),
+            Cost::MAX,
+            "an extreme public wall toll must saturate after scaling"
         );
     }
 }
