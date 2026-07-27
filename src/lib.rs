@@ -13,8 +13,9 @@ pub use local::follower::{
     line_walkable, node_center, steering_direction,
 };
 pub use local::moves::{
-    ClimbMove, LavaPolicy, Move, MoveContext, MovementCosts, WaterPolicy, default_moves,
-    lava_risk, lava_transition_allowed,
+    ClimbMove, FallMove, JumpMove, LavaPolicy, Move, MoveContext, MovementCosts, ParkourMove,
+    SwimMove, WalkMove, WaterPolicy, default_moves, lava_risk, lava_transition_allowed,
+    wall_proximity_penalty,
 };
 pub use local::world::{BlockKind, WorldSnapshot, WorldView, classify_state};
 pub use plugin::{

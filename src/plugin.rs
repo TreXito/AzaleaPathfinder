@@ -130,6 +130,22 @@ struct ActiveNavigation {
 #[derive(Component)]
 struct NavigationTerminal;
 
+/// Marks a plan that is refreshing a route the bot is still walking.
+///
+/// A dynamic goal is replanned on a timer, and that used to be done the same
+/// way as recovering from a dead end: stop the bot, throw the follower away,
+/// and stand still until the new plan arrives. Once a second. Following a
+/// player who is walking in a straight line therefore looked like the bot
+/// repeatedly changing its mind and stopping to think, which is exactly what it
+/// was doing, and a search that took longer than the replan interval could keep
+/// it stationary indefinitely.
+///
+/// Nothing is wrong when a refresh is planned, so nothing is torn down. The bot
+/// keeps walking the route it has, the search runs on the task pool as usual,
+/// and the new path is swapped in only once it is ready.
+#[derive(Component)]
+struct PlanRefresh;
+
 /// Blocks this navigation has already failed on, and what they now cost.
 ///
 /// Cleared whenever a new [`NavigationRequest`] arrives, because the memory is
@@ -283,7 +299,7 @@ fn start_requested_navigation(
         if changed {
             commands
                 .entity(entity)
-                .remove::<(ActiveNavigation, NavigationTask, NavigationTerminal)>();
+                .remove::<(ActiveNavigation, NavigationTask, NavigationTerminal, PlanRefresh)>();
         }
         // Stop old movement while the replacement path is planned.
         stop(entity, &mut walk_events);
@@ -468,18 +484,48 @@ fn poll_navigation_tasks(
         Option<&AvoidMemory>,
         &Physics,
         Option<&azalea::player::GameProfileComponent>,
+        Option<&ActiveNavigation>,
+        Option<&PlanRefresh>,
+        Option<&NavigationTerminal>,
     )>,
 ) {
-    for (entity, current, mut task, world_holder, avoid, physics, profile) in &mut query {
+    for (
+        entity,
+        current,
+        mut task,
+        world_holder,
+        avoid,
+        physics,
+        profile,
+        active,
+        refresh,
+        terminal,
+    ) in &mut query
+    {
         let avoid = avoid.map(AvoidMemory::snapshot).unwrap_or_default();
         let Some(result) = future::block_on(future::poll_once(&mut task.0)) else {
             continue;
         };
-        commands.entity(entity).remove::<NavigationTask>();
+        commands
+            .entity(entity)
+            .remove::<(NavigationTask, PlanRefresh)>();
         if *current != result.request {
             continue;
         }
+        // The journey ended while this plan was still being searched. Acting on
+        // it would restart a bot that has already arrived or already failed.
+        if terminal.is_some() {
+            continue;
+        }
+        // A refresh is a replacement for a route the bot is still walking, and
+        // it is only worth having if it is a route. Anything that would end the
+        // journey, or that goes nowhere, leaves the current one alone: the bot
+        // is mid-stride on a path that was fine a second ago.
+        let refreshing = refresh.is_some() && active.is_some();
         if result.reached_goal && result.path.nodes.len() < 2 {
+            if refreshing {
+                continue;
+            }
             commands.entity(entity).insert((
                 NavigationStatus::Arrived {
                     generation: current.generation,
@@ -502,6 +548,9 @@ fn poll_navigation_tasks(
             + (end.y - result.start.y).abs()
             + (end.z - result.start.z).abs();
         if !result.reached_goal && travelled < STALL_RADIUS {
+            if refreshing {
+                continue;
+            }
             // A block position taken mid-fall is not a place the planner can
             // reason about: the feet are in air with air underneath, so no move
             // applies and the plan comes back empty however good the route is.
@@ -585,7 +634,16 @@ fn poll_navigation_tasks(
         // ingame is exactly the route the follower is about to walk - and it
         // refreshes the instant the bot changes its mind.
         write_path_viz(profile, current.goal.position(), &result.path);
-        let follower = PathFollower::new(result.path, settings.follower.clone(), current.path_seed);
+        let mut follower =
+            PathFollower::new(result.path, settings.follower.clone(), current.path_seed);
+        // Carry the walking clock across a swap. A refreshed path is the same
+        // journey continued, not a new one, so it must not hand back a full
+        // `max_follow_ticks`: a bot refreshing once a second would reset the
+        // budget faster than it could ever be spent, and the one safety net
+        // that catches a route being walked forever would never fire.
+        if let (true, Some(active)) = (refreshing, active) {
+            follower.resume_after(active.follower.elapsed_ticks());
+        }
         commands.entity(entity).insert((
             ActiveNavigation {
                 follower,
@@ -617,6 +675,7 @@ fn tick_navigation(
         Option<&Hunger>,
         &mut ActiveNavigation,
         Option<&mut AvoidMemory>,
+        Option<&NavigationTask>,
     )>,
     mut walk_events: MessageWriter<StartWalkEvent>,
     mut sprint_events: MessageWriter<StartSprintEvent>,
@@ -633,6 +692,7 @@ fn tick_navigation(
         hunger,
         mut active,
         mut avoid,
+        task,
     ) in &mut query
     {
         let paused = paused.is_some_and(|paused| paused.0);
@@ -738,7 +798,12 @@ fn tick_navigation(
             }
             FollowerDirective::Arrived if active.reached_goal => {
                 stop(entity, &mut walk_events);
-                commands.entity(entity).remove::<ActiveNavigation>();
+                // Cancel a refresh planned for a journey that has just ended,
+                // or it would land after arrival and start the bot walking
+                // again on a route to somewhere it already is.
+                commands
+                    .entity(entity)
+                    .remove::<(ActiveNavigation, NavigationTask, PlanRefresh)>();
                 commands.entity(entity).insert((
                     NavigationStatus::Arrived {
                         generation: request.generation,
@@ -772,8 +837,14 @@ fn tick_navigation(
                     memory.blame(at);
                 }
                 let avoid = avoid.as_deref().map(AvoidMemory::snapshot).unwrap_or_default();
+                // Whatever happens next supersedes a refresh planned for the
+                // route that just died, so drop the marker: the plan below is a
+                // recovery attempt and has to be treated as one.
+                commands.entity(entity).remove::<PlanRefresh>();
                 if active.legs >= settings.max_plan_legs.max(1) {
-                    commands.entity(entity).remove::<ActiveNavigation>();
+                    commands
+                        .entity(entity)
+                        .remove::<(ActiveNavigation, NavigationTask)>();
                     commands.entity(entity).insert((
                         NavigationStatus::Failed {
                             generation: request.generation,
@@ -806,24 +877,32 @@ fn tick_navigation(
         if matches!(request.goal, NavigationGoal::Dynamic { .. })
             && settings.dynamic_replan_ticks > 0
             && active.dynamic_ticks >= settings.dynamic_replan_ticks
+            // One at a time. Without this a search slower than the replan
+            // interval would have a fresh copy of itself queued behind it on
+            // every tick until the task pool was full of stale plans.
+            && task.is_none()
         {
-            stop(entity, &mut walk_events);
+            active.dynamic_ticks = 0;
             let task = spawn_plan(
                 *request,
                 BlockPos::from(&**position),
                 world_holder.shared.clone(),
                 settings.clone(),
-                active.legs + 1,
+                // A refresh is not another attempt at a route that failed, so
+                // it does not spend the leg budget. Charging it meant following
+                // a player for `max_plan_legs` seconds and then giving up for
+                // no reason, having walked the whole way without a single thing
+                // going wrong.
+                active.legs,
                 active.stalled_legs,
                 avoid.as_deref().map(AvoidMemory::snapshot).unwrap_or_default(),
             );
-            commands.entity(entity).remove::<ActiveNavigation>();
-            commands.entity(entity).insert((
-                NavigationTask(task),
-                NavigationStatus::Planning {
-                    generation: request.generation,
-                },
-            ));
+            // Deliberately no `stop` and no teardown: the bot carries on
+            // walking its current route, and the status stays `Following`,
+            // because it is.
+            commands
+                .entity(entity)
+                .insert((NavigationTask(task), PlanRefresh));
         }
     }
 }
@@ -856,7 +935,7 @@ fn stop_removed_navigation(
         stop(entity, &mut walk_events);
         commands
             .entity(entity)
-            .remove::<(NavigationTask, ActiveNavigation, NavigationTerminal)>();
+            .remove::<(NavigationTask, ActiveNavigation, NavigationTerminal, PlanRefresh)>();
         commands.entity(entity).insert(NavigationStatus::Idle);
     }
 }

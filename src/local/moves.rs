@@ -317,7 +317,7 @@ pub fn wall_proximity_penalty(pos: BlockPos, world: &dyn WorldView, per_wall: Co
 
 /// Adds a flat cost when the player's feet, head, or floor touches lava.
 pub fn lava_penalty(pos: BlockPos, world: &dyn WorldView, per: Cost) -> Cost {
-    if per == 0 {
+    if per == 0 || !world.may_contain_lava() {
         return 0;
     }
     let touches_lava = world.block(pos) == BlockKind::Lava
@@ -328,6 +328,9 @@ pub fn lava_penalty(pos: BlockPos, world: &dyn WorldView, per: Cost) -> Cost {
 
 /// Returns lava exposure within `clearance`; zero means safe.
 pub fn lava_risk(pos: BlockPos, world: &dyn WorldView, clearance: i32) -> Cost {
+    if !world.may_contain_lava() {
+        return 0;
+    }
     let clearance = clearance.max(0);
     let mut nearest: Option<i32> = None;
     for dx in -clearance..=clearance {
@@ -364,7 +367,7 @@ pub fn lava_proximity_penalty(
     radius: i32,
     per_block: Cost,
 ) -> Cost {
-    if per_block == 0 || radius <= 0 {
+    if per_block == 0 || radius <= 0 || !world.may_contain_lava() {
         return 0;
     }
 
@@ -652,7 +655,7 @@ impl Move for ParkourMove {
         // often have nothing underneath them at all, so requiring solid ground
         // below the takeoff silently disables parkour across exactly the
         // terrain that needs it.
-        let debug = std::env::var("PF_PARKOUR_DEBUG").is_ok();
+        let debug = parkour_debug();
         if debug {
             eprintln!(
                 "parkour@{:?}: here={:?} below={:?} up1={:?} up2={:?} east={:?} east2={:?} east3={:?} east4={:?}",
@@ -674,9 +677,42 @@ impl Move for ParkourMove {
             }
             return;
         }
+        // Nothing to jump over, so nothing to plan. Every offset this rule
+        // offers is at least two blocks out, and the line to any of them passes
+        // through one of the eight columns touching the takeoff - so if all
+        // eight can be walked on, every candidate below is going to fail the
+        // "the crossed columns are a real gap" test, one expensive line scan at
+        // a time. Standing in the open is also the overwhelmingly common case:
+        // this rule cost 10.2us per node against 0.34us for every other rule
+        // put together, and almost all of it was spent proving there was no gap
+        // beside a bot standing in the middle of a field.
+        if !beside_a_gap(world, from) {
+            return;
+        }
 
-        for (ox, oz) in jump_offsets() {
-            let distance = ((ox * ox + oz * oz) as f64).sqrt();
+        for line in jump_lines() {
+            let (ox, oz, distance) = (line.ox, line.oz, line.distance);
+            // The columns this jump flies over, and whether they are a real gap
+            // at takeoff height with room to fly through.
+            //
+            // Every candidate landing along this line needs exactly that,
+            // whether it rises or drops, so it is asked once per direction
+            // rather than once per candidate. The descent alone considers ten
+            // depths, and each used to re-scan the whole line from scratch.
+            let mids = &line.mids[..line.mid_count];
+            let column = |mid: &(i32, i32), dy: i32| offset(from, mid.0, dy, mid.1);
+            // Room to fly through the whole line at one height above takeoff.
+            let flyable = |dy: i32| mids.iter().all(|mid| passable(world, column(mid, dy)));
+            // Not a gap means walking is available and cheaper, or the line is
+            // blocked. Either way there is no jump to plan along it.
+            if !mids.iter().all(|mid| !world.standable(column(mid, 0))) || !(0..=2).all(flyable) {
+                continue;
+            }
+            // A run-up depends on the direction of the jump, not on how high it
+            // lands, so it is the same answer for every rise and drop below.
+            // Asking once per offset instead of once per candidate is worth
+            // having: each answer is up to nine standability tests.
+            let mut run_up_cache: Option<bool> = None;
             // Landing level or one block up. Real terrain almost never offers
             // a flat gap: the far side of a broken bridge is usually a step
             // higher, and refusing that is why a bot stands at the edge doing
@@ -700,7 +736,15 @@ impl Move for ParkourMove {
                 // the whole thing was invisible to the planner and a bot sent
                 // to the far end walked underneath it and reported that there
                 // was no route.
-                let run_up = has_run_up(world, from, ox, oz, 1);
+                // Cheapest test first. Whether there is anything to land on is
+                // three block reads; whether there is a run-up behind us is up
+                // to nine standability tests, and asking that about a landing
+                // that does not exist is most of what this rule used to do.
+                let to = offset(from, ox, rise, oz);
+                if !dry_standable(world, to) {
+                    continue;
+                }
+                let run_up = *run_up_cache.get_or_insert_with(|| has_run_up(world, from, ox, oz, 1));
                 let limit = match (rise > 0, run_up) {
                     (false, true) => MAX_FLAT_JUMP,
                     (true, true) => MAX_RISING_JUMP,
@@ -716,19 +760,11 @@ impl Move for ParkourMove {
                     }
                     continue;
                 }
-                let to = offset(from, ox, rise, oz);
-                if !dry_standable(world, to) {
-                    continue;
-                }
-                // The whole line has to be a real gap: nothing to stand on
-                // (or WalkMove already covers it more cheaply) and nothing in
-                // the way of an arc that peaks above the higher end.
+                // A rising arc peaks a block higher than a level one, so it
+                // needs one more block of clearance over the gap than the
+                // shared test above already established.
                 let head = 2 + rise;
-                let clear = crossed_columns(from, ox, oz).all(|mid| {
-                    !world.standable(mid)
-                        && (0..=head).all(|dy| passable(world, offset(mid, 0, dy, 0)))
-                });
-                if !clear {
+                if rise > 0 && !flyable(head) {
                     continue;
                 }
                 // Room to land without clipping our head, and room to get our
@@ -742,7 +778,7 @@ impl Move for ParkourMove {
                 // The longest jumps need more than one block of run-up, not
                 // just any. This still bites only above 3.5, which is further
                 // than a standing jump can reach anyway.
-                let blocks = distance.round() as i32;
+                let blocks = line.blocks;
                 if distance > 3.5 && !has_run_up(world, from, ox, oz, 2) {
                     if debug {
                         eprintln!("  skip {ox},{oz}/{rise}: run-up too short");
@@ -776,25 +812,44 @@ impl Move for ParkourMove {
                 continue;
             }
             for drop in 1..=ctx.max_fall {
-                let to = offset(from, ox, -drop, oz);
-                if !dry_standable(world, to) {
+                // The gap has to stay a gap all the way down, not just at
+                // takeoff height: if any crossed column can be stood on on the
+                // way past, walking down is cheaper and safer than jumping.
+                // Only the newly exposed level needs testing, because every
+                // level above it was cleared on an earlier pass of this loop or
+                // by the shared test before it.
+                if !mids.iter().all(|mid| {
+                    let level = column(mid, -drop);
+                    passable(world, level) && !world.standable(level)
+                }) {
                     break;
                 }
-                // The crossed columns must be a real gap for the whole descent,
-                // not just at takeoff height: if any of them can be stood on on
-                // the way past, walking down is cheaper and safer than jumping.
-                let clear = crossed_columns(from, ox, oz).all(|mid| {
-                    (-drop..=2).all(|dy| passable(world, offset(mid, 0, dy, 0)))
-                        && (-drop..=0).all(|dy| !world.standable(offset(mid, 0, dy, 0)))
-                });
-                if !clear {
-                    break;
+                let to = offset(from, ox, -drop, oz);
+                if !dry_standable(world, to) {
+                    // Keep looking further down the same column while it is
+                    // empty, and stop the moment something solid is in the way.
+                    //
+                    // This used to stop at the first level that was not
+                    // standable, which over a gap is the level immediately
+                    // below the takeoff, on every jump. So the only descent the
+                    // rule could express was a drop of exactly one, and the case
+                    // it exists for is the other one: a terrace reached by a
+                    // rising jump has no reverse move, so a bot that walked up
+                    // the mountain had no legal way back down it. `FallMove`
+                    // does not cover this, because it steps one block sideways
+                    // and then drops straight, so it cannot cross a gap at all.
+                    if !open(world, to) {
+                        break;
+                    }
+                    continue;
                 }
                 if !passable(world, offset(to, 0, 1, 0)) {
                     break;
                 }
-                let blocks = distance.round() as i32;
-                if blocks >= 3 && !has_run_up(world, from, ox, oz, 1) {
+                let blocks = line.blocks;
+                if blocks >= 3
+                    && !*run_up_cache.get_or_insert_with(|| has_run_up(world, from, ox, oz, 1))
+                {
                     break;
                 }
                 let hurt = if in_water(world, to) {
@@ -842,46 +897,125 @@ const MAX_STANDING_JUMP: f64 = 3.05;
 /// jump rather than an exotic one.
 const MAX_STANDING_RISING_JUMP: f64 = 3.05;
 
-/// Every landing offset worth considering, nearest first.
+/// One landing offset the rule considers, with everything about it that does
+/// not depend on where the bot is standing.
+///
+/// The geometry of a jump is the same wherever it is taken from: the columns it
+/// crosses are a fixed set of offsets from the takeoff, and its length and
+/// rounded block count are fixed too. Working that out per node meant a square
+/// root and a sixteen-sample line walk with a dedup scan, for each of forty-odd
+/// offsets, on every node the search expanded.
+struct JumpLine {
+    ox: i32,
+    oz: i32,
+    distance: f64,
+    /// `distance` rounded, which is what the move is priced and executed by.
+    blocks: i32,
+    /// Offsets of the columns flown over, excluding both ends.
+    mids: [(i32, i32); MAX_CROSSED],
+    mid_count: usize,
+}
+
+/// Every landing offset worth considering.
 ///
 /// Cardinal-only jumps miss most real terrain: stepping stones, ruined bridges
 /// and rock faces put the next foothold off-axis, and a bot that will only
 /// jump along x or z simply stops at the edge. Offsets shorter than two blocks
 /// are left out because walking or stepping up already covers them, and more
 /// cheaply.
-fn jump_offsets() -> impl Iterator<Item = (i32, i32)> {
-    let reach = MAX_FLAT_JUMP.ceil() as i32;
-    (-reach..=reach).flat_map(move |ox| {
-        (-reach..=reach).filter_map(move |oz| {
-            let distance = ((ox * ox + oz * oz) as f64).sqrt();
-            (distance >= 2.0 && distance <= MAX_FLAT_JUMP).then_some((ox, oz))
-        })
+fn jump_lines() -> &'static [JumpLine] {
+    static LINES: std::sync::OnceLock<Vec<JumpLine>> = std::sync::OnceLock::new();
+    LINES.get_or_init(|| {
+        let reach = MAX_FLAT_JUMP.ceil() as i32;
+        let mut lines = Vec::new();
+        for ox in -reach..=reach {
+            for oz in -reach..=reach {
+                let distance = ((ox * ox + oz * oz) as f64).sqrt();
+                if !(2.0..=MAX_FLAT_JUMP).contains(&distance) {
+                    continue;
+                }
+                let (mids, mid_count) = crossed_offsets(ox, oz);
+                lines.push(JumpLine {
+                    ox,
+                    oz,
+                    distance,
+                    blocks: distance.round() as i32,
+                    mids,
+                    mid_count,
+                });
+            }
+        }
+        lines
     })
 }
 
-/// The block columns a jump passes over, excluding both ends.
+/// Whether any of the eight columns touching `from` is something the bot could
+/// not walk onto, at takeoff height.
+///
+/// This is the precondition for a gap jump existing at all. Every landing this
+/// rule considers is at least two blocks away, and the sampled line to any of
+/// them passes through one of these eight columns, so a takeoff with walkable
+/// ground on all eight sides cannot produce a single legal parkour edge: the
+/// "crossed columns must be a real gap" test rejects every one of them. Proving
+/// that here costs eight standability tests; proving it the long way costs a
+/// line scan per candidate landing, about 130 of them.
+fn beside_a_gap(world: &dyn WorldView, from: BlockPos) -> bool {
+    CARDINALS
+        .into_iter()
+        .chain(DIAGONALS)
+        .any(|(dx, dz)| !world.standable(offset(from, dx, 0, dz)))
+}
+
+/// The most intermediate columns any jump in range can cross.
+///
+/// The longest offset is four blocks of travel, sampled every quarter block, so
+/// three whole columns lie between the ends of a cardinal jump and no diagonal
+/// reaches more. Six is headroom over the worst case rather than a limit that
+/// is ever met.
+const MAX_CROSSED: usize = 6;
+
+/// The columns a jump passes over, as offsets from the takeoff, excluding both
+/// ends.
 ///
 /// Sampled along the straight line rather than stepped per axis, so a diagonal
 /// jump checks the columns it actually flies over instead of an L-shaped path
 /// it never takes.
-fn crossed_columns(from: BlockPos, ox: i32, oz: i32) -> impl Iterator<Item = BlockPos> {
+///
+/// Computed once per offset into [`jump_lines`] rather than per node: this used
+/// to allocate a `Vec` per candidate landing, roughly 130 times for every node
+/// the search expanded, for a list that never holds more than three entries.
+fn crossed_offsets(ox: i32, oz: i32) -> ([(i32, i32); MAX_CROSSED], usize) {
     let distance = ((ox * ox + oz * oz) as f64).sqrt();
     let steps = (distance * 4.0).ceil() as i32;
-    let landing = BlockPos::new(from.x + ox, from.y, from.z + oz);
-    let mut seen = Vec::new();
+    let mut seen = [(0, 0); MAX_CROSSED];
+    let mut len = 0;
     for step in 1..steps {
         let t = step as f64 / steps as f64;
-        let x = from.x + (ox as f64 * t).round() as i32;
-        let z = from.z + (oz as f64 * t).round() as i32;
-        let pos = BlockPos::new(x, from.y, z);
+        let x = (ox as f64 * t).round() as i32;
+        let z = (oz as f64 * t).round() as i32;
         // Both ends are checked separately: the takeoff is where we already
         // stand, and the landing is standable on purpose, so including it here
         // rejects every jump.
-        if pos != from && pos != landing && !seen.contains(&pos) {
-            seen.push(pos);
+        if (x, z) == (0, 0) || (x, z) == (ox, oz) || seen[..len].contains(&(x, z)) {
+            continue;
         }
+        // Truncating would silently wave a jump through over a column nobody
+        // checked, so the buffer is sized for the worst case and this is only
+        // here to say so out loud if the offset table ever grows.
+        assert!(len < MAX_CROSSED, "jump {ox},{oz} crosses over {MAX_CROSSED} columns");
+        seen[len] = (x, z);
+        len += 1;
     }
-    seen.into_iter()
+    (seen, len)
+}
+
+/// `PF_PARKOUR_DEBUG=1` traces every jump this rule considers and rejects.
+///
+/// Read once. `std::env::var` takes a lock and allocates a `String`, and this
+/// was being asked on every node of every search.
+fn parkour_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PF_PARKOUR_DEBUG").is_ok())
 }
 
 /// Whether there is somewhere to run up from, `back` blocks behind the takeoff.
@@ -1171,6 +1305,90 @@ mod tests {
             reach.cost
         );
     }
+    /// A gap jump onto a landing several blocks lower has to be plannable.
+    ///
+    /// The rule that offers these searched downward from the takeoff and
+    /// stopped at the first level that was not standable - which, over a gap, is
+    /// the level immediately below the takeoff, every time. So the only descent
+    /// it could ever express was a drop of exactly one, and the whole reason it
+    /// exists is the other case: a terrace climbed by a rising jump has no
+    /// reverse move, so a bot that walked up the hub mountain had no legal way
+    /// back off it and stood on the summit.
+    #[test]
+    fn a_gap_jump_can_land_several_blocks_lower() {
+        use std::collections::HashMap;
+        struct Grid(HashMap<(i32, i32, i32), BlockKind>);
+        impl WorldView for Grid {
+            fn block(&self, p: BlockPos) -> BlockKind {
+                self.0.get(&(p.x, p.y, p.z)).copied().unwrap_or(BlockKind::Air)
+            }
+        }
+
+        // A ledge at y=64 facing a landing four blocks down across a two block
+        // gap. Nothing at all in the gap, so the only way across is the jump.
+        let mut blocks = HashMap::new();
+        for z in -1..=1 {
+            for x in -2..=0 {
+                blocks.insert((x, 63, z), BlockKind::Solid);
+            }
+            for x in 3..=5 {
+                blocks.insert((x, 59, z), BlockKind::Solid);
+            }
+        }
+        let world = Grid(blocks);
+
+        let mut edges = Vec::new();
+        ParkourMove.candidates(BlockPos::new(0, 64, 0), &world, &MoveContext::default(), &mut edges);
+
+        let landing = BlockPos::new(3, 60, 0);
+        assert!(
+            edges.iter().any(|e| e.to == landing),
+            "no jump down onto the far side; got {:?}",
+            edges.iter().map(|e| (e.to, e.kind)).collect::<Vec<_>>()
+        );
+    }
+
+    /// And it must still refuse to jump into a wall.
+    ///
+    /// Searching further down a column is only correct while the column is
+    /// empty: if the far side is solid rock at the takeoff's own height, there
+    /// is no landing below it, there is a cliff face.
+    #[test]
+    fn a_gap_jump_does_not_tunnel_through_the_far_wall() {
+        use std::collections::HashMap;
+        struct Grid(HashMap<(i32, i32, i32), BlockKind>);
+        impl WorldView for Grid {
+            fn block(&self, p: BlockPos) -> BlockKind {
+                self.0.get(&(p.x, p.y, p.z)).copied().unwrap_or(BlockKind::Air)
+            }
+        }
+
+        let mut blocks = HashMap::new();
+        for z in -1..=1 {
+            for x in -2..=0 {
+                blocks.insert((x, 63, z), BlockKind::Solid);
+            }
+            // A solid mass on the far side of the gap, with a standable pocket
+            // buried inside it that no jump can reach.
+            for x in 3..=5 {
+                for y in 58..=64 {
+                    blocks.insert((x, y, z), BlockKind::Solid);
+                }
+            }
+            blocks.remove(&(3, 60, z));
+            blocks.remove(&(3, 61, z));
+        }
+        let world = Grid(blocks);
+
+        let mut edges = Vec::new();
+        ParkourMove.candidates(BlockPos::new(0, 64, 0), &world, &MoveContext::default(), &mut edges);
+
+        assert!(
+            !edges.iter().any(|e| e.to == BlockPos::new(3, 60, 0)),
+            "planned a jump into a pocket inside a cliff"
+        );
+    }
+
     /// The wall toll scales with room: a corridor is charged far less than an
     /// open plaza, because in a corridor there is no way to be more central.
     #[test]

@@ -18,6 +18,11 @@ fn cached_lava_risk(
     let super::moves::LavaPolicy::Forbidden { clearance } = ctx.lava_policy else {
         return 0;
     };
+    // No lava in the region means no cache to consult either: the hash of a
+    // block position is not free at a hundred thousand nodes a search.
+    if !world.may_contain_lava() {
+        return 0;
+    }
     *risks
         .entry((pos.x, pos.y, pos.z))
         .or_insert_with(|| super::moves::lava_risk(pos, world, clearance))

@@ -246,6 +246,22 @@ impl PathFollower {
         self.idx
     }
 
+    /// Ticks this follower has spent walking.
+    pub fn elapsed_ticks(&self) -> u32 {
+        self.total_ticks
+    }
+
+    /// Continue another follower's walking clock instead of starting a fresh
+    /// one.
+    ///
+    /// Replacing the path of a journey already in progress must not also
+    /// replace how long it has been going: `max_follow_ticks` is the only thing
+    /// that catches a route being walked forever, and a goal replanned on a
+    /// timer would otherwise reset it faster than it could ever be spent.
+    pub fn resume_after(&mut self, ticks: u32) {
+        self.total_ticks = self.total_ticks.max(ticks);
+    }
+
     pub fn tick(&mut self, world: &dyn WorldView, frame: FollowerFrame) -> FollowerDirective {
         if self.path.nodes.len() < 2 {
             return FollowerDirective::Arrived;
