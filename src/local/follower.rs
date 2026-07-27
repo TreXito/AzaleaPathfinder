@@ -517,9 +517,25 @@ impl PathFollower {
         // walked into every step, stalled, and only then hopped. On a slope
         // that reads as a bot that cannot climb. If the path says the next
         // node is a step up, jump when we are close enough to land on it.
+        // Measured against the node we are about to arrive at, never against the
+        // smoothed steering target.
+        //
+        // Smoothing aims at the furthest node still in sight, up to twelve
+        // ahead, and it is allowed to differ in height by a block. So "is there
+        // a step in front of me" was being answered by a block up to twelve
+        // paces away: on level ground beside a wall, with the route rising later
+        // on, the bot read a node it had not reached yet as a step under its
+        // feet and hopped, on every tick it was in contact with the wall. Over a
+        // village-to-mine round trip that was the single largest source of
+        // jumps, and 91% of all jumps in the worst run gained no height at all.
+        //
+        // The block being stepped onto is `nodes[idx]`, and it is the only
+        // honest answer to both questions below: how far away the step is, and
+        // whether it is above us.
+        let immediate = node_center(nodes[self.idx].pos);
         let stepping_up = matches!(nodes[self.idx].reached_by, crate::MoveKind::Jump)
-            && dist_xz(frame.position, target) < STEP_UP_RANGE
-            && target.y - frame.position.y > self.settings.jump_height_threshold.max(0.0);
+            && dist_xz(frame.position, immediate) < STEP_UP_RANGE
+            && immediate.y - frame.position.y > self.settings.jump_height_threshold.max(0.0);
 
         // Sliding down a ladder is done by letting go, not by walking. The
         // rung below is directly underfoot, so any forward input is sideways
@@ -556,16 +572,32 @@ impl PathFollower {
             target
         };
 
+        // Blocked, with the block we are trying to enter above us: hop onto it.
+        // Same correction as `stepping_up` above, and for the same reason - a
+        // wall beside the path is not a step, however high the route goes later.
+        let blocked_below_a_rise = frame.horizontal_collision
+            && immediate.y - frame.position.y > self.settings.jump_height_threshold.max(0.0);
+        let shove = frame.horizontal_collision
+            && (self.stalled == self.escape_hop_a || self.stalled == self.escape_hop_b);
         let jump = swimming_up
             || climbing_up
-            || frame.on_ground
-                && (taking_off
-                    || stepping_up
-                    || frame.horizontal_collision
-                        && (target.y - frame.position.y
-                            > self.settings.jump_height_threshold.max(0.0)
-                            || self.stalled == self.escape_hop_a
-                            || self.stalled == self.escape_hop_b));
+            || frame.on_ground && (taking_off || stepping_up || blocked_below_a_rise || shove);
+        if jump && jump_debug() {
+            let reason = if swimming_up {
+                "swim"
+            } else if climbing_up {
+                "climb"
+            } else if taking_off {
+                "parkour"
+            } else if stepping_up {
+                "step-up"
+            } else if blocked_below_a_rise {
+                "blocked-below-a-rise"
+            } else {
+                "shove"
+            };
+            eprintln!("jump {reason}");
+        }
         // Sprint state is part of the jump, not a preference: a sprint jump
         // travels about 4 blocks and a walking jump about 2.5, so sprinting a
         // 2 block hop sails straight over the landing block, and walking a 3
@@ -866,6 +898,16 @@ fn passed(pos: Vec3, node: Vec3, next: Vec3) -> bool {
 ///
 /// A ladder's collision box is a sliver against this block, and its whole
 /// purpose here is to give the climb something to press against.
+/// `PF_JUMP_DEBUG=1` names the rule behind every jump the follower asks for.
+///
+/// Worth having permanently: a bot that hops constantly looks like one bug and
+/// is usually another, and the five rules that can raise a jump are impossible
+/// to tell apart from outside.
+fn jump_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PF_JUMP_DEBUG").is_ok())
+}
+
 fn ladder_wall(world: &dyn WorldView, feet: BlockPos) -> Option<BlockPos> {
     if world.block(feet) != BlockKind::Climbable {
         return None;
@@ -968,6 +1010,115 @@ mod tests {
             ),
             FollowerDirective::Arrived
         );
+    }
+
+    /// Scraping a wall on level ground is not a reason to jump.
+    ///
+    /// The jump rules used to ask whether the *smoothed steering target* was
+    /// above the feet, and smoothing aims up to twelve nodes ahead at a node
+    /// allowed to differ in height by a block. So a bot walking a flat stretch
+    /// beside a wall, on a route that climbs later, read a node it had not
+    /// reached as a step under its feet and hopped on every tick it was in
+    /// contact. Measured on a village-to-mine round trip: the largest single
+    /// source of jumps, and in the worst run 91% of all jumps gained no height.
+    #[test]
+    fn a_wall_beside_a_level_path_does_not_make_the_bot_hop() {
+        // Flat floor the whole way, with a wall along one side to scrape.
+        let mut blocks = HashMap::new();
+        for x in -2..=14 {
+            blocks.insert((x, 63, 0), BlockKind::Solid);
+            for h in 0..=1 {
+                blocks.insert((x, 64 + h, 1), BlockKind::Solid);
+            }
+        }
+        // The route is level underfoot but ends a block higher, which is what
+        // the smoothed target used to pick up.
+        let mut nodes: Vec<PathNode> = (0..=9)
+            .map(|x| PathNode {
+                pos: BlockPos::new(x, 64, 0),
+                reached_by: if x == 0 {
+                    crate::MoveKind::Start
+                } else {
+                    crate::MoveKind::Walk
+                },
+            })
+            .collect();
+        nodes.push(PathNode {
+            pos: BlockPos::new(10, 65, 0),
+            reached_by: crate::MoveKind::Jump,
+        });
+        blocks.insert((10, 64, 0), BlockKind::Solid);
+        let world = Grid(blocks);
+
+        let mut follower = PathFollower::new(
+            Path { nodes, total_cost: 100 },
+            FollowerSettings::default(),
+            11,
+        );
+        // Standing on the second node, pressed against the wall, far from the
+        // step at the far end.
+        let directive = follower.tick(
+            &world,
+            FollowerFrame {
+                position: Vec3::new(1.5, 64.0, 0.5),
+                on_ground: true,
+                horizontal_collision: true,
+                paused: false,
+            },
+        );
+        match directive {
+            FollowerDirective::Move { jump, .. } => {
+                assert!(!jump, "hopped while scraping a wall on level ground");
+            }
+            other => panic!("expected a Move, got {other:?}"),
+        }
+    }
+
+    /// But a step directly in front still gets hopped, promptly.
+    #[test]
+    fn a_step_in_front_is_still_jumped() {
+        let mut blocks = HashMap::new();
+        for x in -2..=1 {
+            blocks.insert((x, 63, 0), BlockKind::Solid);
+        }
+        // A raised shelf from x=2 onward, which the plan steps up onto. It runs
+        // well past the step so the far end is not close enough to count as
+        // arriving, which would end the tick before any jump is decided.
+        for x in 2..=10 {
+            blocks.insert((x, 64, 0), BlockKind::Solid);
+        }
+        let world = Grid(blocks);
+
+        let mut nodes = vec![
+            PathNode { pos: BlockPos::new(0, 64, 0), reached_by: crate::MoveKind::Start },
+            PathNode { pos: BlockPos::new(1, 64, 0), reached_by: crate::MoveKind::Walk },
+            PathNode { pos: BlockPos::new(2, 65, 0), reached_by: crate::MoveKind::Jump },
+        ];
+        nodes.extend((3..=10).map(|x| PathNode {
+            pos: BlockPos::new(x, 65, 0),
+            reached_by: crate::MoveKind::Walk,
+        }));
+        let mut follower =
+            PathFollower::new(Path { nodes, total_cost: 120 }, FollowerSettings::default(), 3);
+        // Walk at the step and watch the whole approach: the follower advances
+        // its node index as it closes, so which tick carries the hop is an
+        // implementation detail. That one of them does is not.
+        let mut jumped = false;
+        for step in 0..6 {
+            let directive = follower.tick(
+                &world,
+                FollowerFrame {
+                    position: Vec3::new(1.2 + 0.15 * f64::from(step), 64.0, 0.5),
+                    on_ground: true,
+                    horizontal_collision: false,
+                    paused: false,
+                },
+            );
+            if let FollowerDirective::Move { jump: true, .. } = directive {
+                jumped = true;
+            }
+        }
+        assert!(jumped, "never hopped onto a step directly in front");
     }
 
     #[test]
