@@ -7,6 +7,7 @@ use azalea::StartWalkEvent;
 use azalea::app::{App, Plugin};
 use azalea::bot::JumpEvent;
 use azalea::ecs::prelude::*;
+use azalea::entity::metadata::Health;
 use azalea::entity::{LocalEntity, LookDirection, Physics, Position};
 use azalea::local_player::{Hunger, WorldHolder};
 use azalea::physics::PhysicsSystems;
@@ -15,9 +16,15 @@ use azalea::{BlockPos, Client, SprintDirection, WalkDirection};
 use bevy_tasks::{AsyncComputeTaskPool, Task};
 use futures_lite::future;
 
+use crate::adaptive::{ProfileError, load_profile_unprepared};
 use crate::{
-    FollowerDirective, FollowerFrame, FollowerSettings, MoveContext, PathFollower, WorldSnapshot,
-    WorldView, default_moves, find_path_best_effort, steering_direction,
+    AdaptiveMode, AdaptiveProfile, AdaptiveRegime, AdaptiveSettings, CostModelSnapshot,
+    FollowerDirective, FollowerFrame, FollowerSettings, GuardSignal, InterruptionReason,
+    MotionPlan, MoveContext, MoveObservation, MovementCosts, ObservationContext,
+    ObservedPathFollower, PathFollower, ProfileKey, PromotionError, PromotionReport, WorldSnapshot,
+    WorldView, default_moves, find_motion_plan_best_effort, follower_settings_hash,
+    move_context_hash, movement_costs_hash, next_observation_nonce, observed_follower_settings,
+    steering_direction,
 };
 
 #[derive(Debug, Clone, Resource)]
@@ -63,6 +70,201 @@ impl Default for PathfinderSettings {
             follower: FollowerSettings::default(),
         }
     }
+}
+
+/// Opt-in adaptive routing configuration.
+///
+/// The default is shadow-only and has no profile key, so installing the plugin
+/// cannot silently persist data or alter route selection. Set an explicit
+/// [`ProfileKey`] before enabling a promoted model.
+#[derive(Debug, Clone, Resource)]
+pub struct AdaptivePathfinderSettings {
+    pub profile: Option<ProfileKey>,
+    pub learner: AdaptiveSettings,
+    pub build_id: String,
+    pub actor_capability_hash: u64,
+    /// Application-maintained revision for the approximately captured world
+    /// view. Live follower validation remains authoritative.
+    pub world_revision: u64,
+}
+
+impl Default for AdaptivePathfinderSettings {
+    fn default() -> Self {
+        Self {
+            profile: None,
+            learner: AdaptiveSettings::default(),
+            build_id: env!("CARGO_PKG_VERSION").into(),
+            actor_capability_hash: 0,
+            world_revision: 1,
+        }
+    }
+}
+
+/// In-memory bounded learner used by the plugin. Disk persistence and JSONL
+/// telemetry remain explicit maintenance-thread operations.
+#[derive(Resource)]
+pub struct AdaptivePathfinderRuntime {
+    profiles: parking_lot::Mutex<std::collections::BTreeMap<ProfileKey, AdaptiveProfile>>,
+    dropped_observations: std::sync::atomic::AtomicU64,
+}
+
+const MAX_ADAPTIVE_PROFILES: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileInstallPolicy {
+    RejectExisting,
+    ReplaceExisting,
+}
+
+impl Default for AdaptivePathfinderRuntime {
+    fn default() -> Self {
+        Self {
+            profiles: parking_lot::Mutex::default(),
+            dropped_observations: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl AdaptivePathfinderRuntime {
+    pub fn allocate_journey_id(&self) -> u64 {
+        next_observation_nonce()
+    }
+
+    pub fn snapshot(
+        &self,
+        key: &ProfileKey,
+        baseline: MovementCosts,
+        settings: &AdaptiveSettings,
+        regime: &AdaptiveRegime,
+    ) -> CostModelSnapshot {
+        if let Some(mut profiles) = self.profiles.try_lock() {
+            if !profiles.contains_key(key) && profiles.len() >= MAX_ADAPTIVE_PROFILES {
+                self.dropped_observations
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return AdaptiveProfile::new(key.clone()).snapshot(baseline, settings, regime);
+            }
+            return profiles
+                .entry(key.clone())
+                .or_insert_with(|| AdaptiveProfile::new(key.clone()))
+                .snapshot(baseline, settings, regime);
+        }
+        // Contention must never block GameTick or planning dispatch. A fresh
+        // profile has no active model, so this is a safe baseline snapshot.
+        self.dropped_observations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        AdaptiveProfile::new(key.clone()).snapshot(baseline, settings, regime)
+    }
+
+    pub fn try_observe(&self, observation: &MoveObservation, settings: &AdaptiveSettings) -> bool {
+        if !observation.validate() {
+            self.dropped_observations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        let Some(mut profiles) = self.profiles.try_lock() else {
+            self.dropped_observations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        };
+        if !profiles.contains_key(&observation.context.profile)
+            && profiles.len() >= MAX_ADAPTIVE_PROFILES
+        {
+            self.dropped_observations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        profiles
+            .entry(observation.context.profile.clone())
+            .or_insert_with(|| AdaptiveProfile::new(observation.context.profile.clone()))
+            .observe(observation, settings)
+    }
+
+    pub fn promote(
+        &self,
+        key: &ProfileKey,
+        report: &PromotionReport,
+        settings: &AdaptiveSettings,
+    ) -> Result<u64, PromotionError> {
+        let mut profiles = self.profiles.lock();
+        if !profiles.contains_key(key) && profiles.len() >= MAX_ADAPTIVE_PROFILES {
+            return Err(PromotionError::ProfileCapacity);
+        }
+        profiles
+            .entry(key.clone())
+            .or_insert_with(|| AdaptiveProfile::new(key.clone()))
+            .promote(report, settings)
+    }
+
+    pub fn rollback(&self, key: &ProfileKey, signal: GuardSignal) -> Result<u64, PromotionError> {
+        let mut profiles = self.profiles.lock();
+        if !profiles.contains_key(key) && profiles.len() >= MAX_ADAPTIVE_PROFILES {
+            return Err(PromotionError::ProfileCapacity);
+        }
+        profiles
+            .entry(key.clone())
+            .or_insert_with(|| AdaptiveProfile::new(key.clone()))
+            .rollback(signal)
+    }
+
+    pub fn profile(&self, key: &ProfileKey) -> Option<AdaptiveProfile> {
+        self.profiles.lock().get(key).cloned()
+    }
+
+    /// Installs a fully validated profile from a maintenance thread. Callers
+    /// must choose explicitly whether an existing in-memory profile may be
+    /// replaced.
+    pub fn install_profile(
+        &self,
+        profile: AdaptiveProfile,
+        policy: ProfileInstallPolicy,
+    ) -> Result<Option<AdaptiveProfile>, ProfileError> {
+        if !profile.validate() {
+            return Err(ProfileError::Invalid);
+        }
+        let mut profiles = self.profiles.lock();
+        let exists = profiles.contains_key(&profile.key);
+        if exists && policy == ProfileInstallPolicy::RejectExisting {
+            return Err(ProfileError::AlreadyExists);
+        }
+        if !exists && profiles.len() >= MAX_ADAPTIVE_PROFILES {
+            return Err(ProfileError::Capacity);
+        }
+        profile.prepare_nonce_allocator()?;
+        Ok(profiles.insert(profile.key.clone(), profile))
+    }
+
+    /// Loads and installs one persisted profile. This performs blocking I/O
+    /// and is therefore intended for startup or another maintenance thread.
+    pub fn load_from(
+        &self,
+        root: &std::path::Path,
+        key: &ProfileKey,
+        policy: ProfileInstallPolicy,
+    ) -> Result<Option<AdaptiveProfile>, ProfileError> {
+        self.install_profile(load_profile_unprepared(root, key)?, policy)
+    }
+
+    pub fn dropped_observations(&self) -> u64 {
+        self.dropped_observations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[derive(Clone)]
+struct AdaptiveLegSeed {
+    key: ProfileKey,
+    model: CostModelSnapshot,
+    regime: AdaptiveRegime,
+    world_revision: u64,
+}
+
+struct PlanLeg {
+    journey_id: u64,
+    legs: u32,
+    stalled_legs: u32,
+    avoid: std::sync::Arc<std::collections::HashMap<BlockPos, crate::Cost>>,
+    health: f32,
+    adaptive: Option<AdaptiveLegSeed>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,15 +318,66 @@ pub enum NavigationStatus {
 #[derive(Component)]
 struct NavigationTask(Task<PlanResult>);
 
+enum ActiveFollower {
+    Plain(Box<PathFollower>),
+    Observed(Box<ObservedPathFollower>),
+}
+
+impl ActiveFollower {
+    fn path(&self) -> &crate::Path {
+        match self {
+            Self::Plain(follower) => follower.path(),
+            Self::Observed(follower) => follower.path(),
+        }
+    }
+
+    fn current_node_index(&self) -> usize {
+        match self {
+            Self::Plain(follower) => follower.current_node_index(),
+            Self::Observed(follower) => follower.current_node_index(),
+        }
+    }
+
+    fn tick(&mut self, world: &dyn WorldView, frame: FollowerFrame) -> FollowerDirective {
+        match self {
+            Self::Plain(follower) => follower.tick(world, frame),
+            Self::Observed(follower) => follower.tick(world, frame),
+        }
+    }
+
+    fn interrupt(&mut self, reason: InterruptionReason) {
+        if let Self::Observed(follower) = self {
+            follower.interrupt(reason);
+        }
+    }
+
+    fn disable_observations(&mut self, reason: InterruptionReason) {
+        if let Self::Observed(follower) = self {
+            follower.disable_observations(reason);
+        }
+    }
+
+    fn drain_observations(&mut self) -> Vec<MoveObservation> {
+        match self {
+            Self::Plain(_) => Vec::new(),
+            Self::Observed(follower) => follower.drain_observations().collect(),
+        }
+    }
+}
+
 #[derive(Component)]
 struct ActiveNavigation {
-    follower: PathFollower,
+    follower: ActiveFollower,
+    journey_id: u64,
     reached_goal: bool,
     planned_goal: BlockPos,
     legs: u32,
     /// Consecutive legs that ended within [`STALL_RADIUS`] of where they began.
     stalled_legs: u32,
     dynamic_ticks: u32,
+    /// Fall limit against which the remaining path was last checked. A
+    /// sentinel forces one check when a newly planned route is installed.
+    checked_fall_limit: i32,
 }
 
 #[derive(Component)]
@@ -177,7 +430,9 @@ impl AvoidMemory {
 
 struct PlanResult {
     request: NavigationRequest,
-    path: Option<crate::Path>,
+    journey_id: u64,
+    plan: Option<MotionPlan>,
+    observation_context: Option<ObservationContext>,
     reached_goal: bool,
     target: BlockPos,
     legs: u32,
@@ -202,12 +457,45 @@ const STALL_RADIUS: i32 = 3;
 /// rather than the same deterministic search run again.
 const MAX_STALLED_LEGS: u32 = 6;
 
+fn is_transient_free_fall(world: &dyn WorldView, position: BlockPos, on_ground: bool) -> bool {
+    if on_ground {
+        return false;
+    }
+    let below = crate::local::world::offset(position, 0, -1, 0);
+    ![world.block(position), world.block(below)]
+        .into_iter()
+        .any(|block| {
+            matches!(
+                block,
+                crate::BlockKind::Water | crate::BlockKind::Lava | crate::BlockKind::Climbable
+            )
+        })
+}
+
+fn next_stalled_retry(
+    legs: u32,
+    stalled_legs: u32,
+    max_plan_legs: u32,
+    transient_free_fall: bool,
+) -> Option<(u32, u32)> {
+    if transient_free_fall {
+        return Some((legs, stalled_legs));
+    }
+    let next_stalled = stalled_legs.saturating_add(1);
+    if next_stalled > MAX_STALLED_LEGS || legs >= max_plan_legs.max(1) {
+        return None;
+    }
+    Some((legs.saturating_add(1), next_stalled))
+}
+
 /// Plans and follows block paths for local players.
 pub struct AzaleaPathfinderPlugin;
 
 impl Plugin for AzaleaPathfinderPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PathfinderSettings>()
+            .init_resource::<AdaptivePathfinderSettings>()
+            .init_resource::<AdaptivePathfinderRuntime>()
             .add_systems(azalea::app::PreUpdate, add_navigation_status)
             .add_systems(
                 azalea::app::Update,
@@ -268,24 +556,37 @@ fn add_navigation_status(
 fn start_requested_navigation(
     mut commands: Commands,
     settings: Res<PathfinderSettings>,
-    query: Query<(
+    adaptive_settings: Res<AdaptivePathfinderSettings>,
+    adaptive_runtime: Res<AdaptivePathfinderRuntime>,
+    mut query: Query<(
         Entity,
         &NavigationRequest,
         Ref<NavigationRequest>,
         &Position,
         &WorldHolder,
+        Option<&Health>,
         Option<&NavigationTask>,
-        Option<&ActiveNavigation>,
+        Option<&mut ActiveNavigation>,
         Option<&NavigationTerminal>,
     )>,
     mut walk_events: MessageWriter<StartWalkEvent>,
 ) {
-    for (entity, request, request_ref, position, world, task, active, terminal) in &query {
+    for (entity, request, request_ref, position, world, health, task, mut active, terminal) in
+        &mut query
+    {
         let changed = request_ref.is_changed();
         if !changed && (task.is_some() || active.is_some() || terminal.is_some()) {
             continue;
         }
         if changed {
+            if let Some(active) = active.as_deref_mut() {
+                active.follower.interrupt(InterruptionReason::GoalChanged);
+                record_observations(
+                    &mut active.follower,
+                    &adaptive_runtime,
+                    &adaptive_settings.learner,
+                );
+            }
             commands
                 .entity(entity)
                 .remove::<(ActiveNavigation, NavigationTask, NavigationTerminal)>();
@@ -297,9 +598,14 @@ fn start_requested_navigation(
             BlockPos::from(&**position),
             world.shared.clone(),
             settings.clone(),
-            1,
-            0,
-            std::sync::Arc::default(),
+            PlanLeg {
+                journey_id: adaptive_runtime.allocate_journey_id(),
+                legs: 1,
+                stalled_legs: 0,
+                avoid: std::sync::Arc::default(),
+                health: health.map_or(0.0, |health| health.0),
+                adaptive: adaptive_leg_seed(&adaptive_settings, &adaptive_runtime, &settings),
+            },
         );
         commands.entity(entity).insert((
             NavigationTask(task),
@@ -312,15 +618,91 @@ fn start_requested_navigation(
     }
 }
 
+fn adaptive_leg_seed(
+    settings: &AdaptivePathfinderSettings,
+    runtime: &AdaptivePathfinderRuntime,
+    pathfinder: &PathfinderSettings,
+) -> Option<AdaptiveLegSeed> {
+    let key = settings.profile.as_ref()?;
+    // Enabled mode without an explicit, valid production profile never gets
+    // here because `profile` is required. Invalid keys likewise fail closed.
+    if settings.learner.mode == AdaptiveMode::Disabled
+        || !key.validate()
+        || key.capability_hash != settings.actor_capability_hash
+    {
+        return None;
+    }
+    let observed_settings = observed_follower_settings(pathfinder.follower.clone());
+    let regime = AdaptiveRegime {
+        build_id: settings.build_id.clone(),
+        planner_settings_hash: move_context_hash(&pathfinder.planner),
+        control_settings_hash: follower_settings_hash(&observed_settings),
+        baseline_costs_hash: movement_costs_hash(pathfinder.planner.costs),
+        actor_capability_hash: settings.actor_capability_hash,
+    };
+    if !regime.validate_for(key) {
+        return None;
+    }
+    Some(AdaptiveLegSeed {
+        key: key.clone(),
+        model: runtime.snapshot(key, pathfinder.planner.costs, &settings.learner, &regime),
+        regime,
+        world_revision: settings.world_revision,
+    })
+}
+
+fn record_observations(
+    follower: &mut ActiveFollower,
+    runtime: &AdaptivePathfinderRuntime,
+    settings: &AdaptiveSettings,
+) {
+    for observation in follower.drain_observations() {
+        runtime.try_observe(&observation, settings);
+    }
+}
+
+/// Conservative fall cap from current health, reserving two hearts for
+/// latency, rounding and unrelated damage. Armor/effects are deliberately not
+/// credited because the planner does not model them.
+fn survivable_fall_limit(health: f32) -> i32 {
+    const RESERVED_HEALTH_POINTS: f32 = 4.0;
+    if !health.is_finite() || health <= RESERVED_HEALTH_POINTS {
+        return crate::local::moves::SAFE_FALL;
+    }
+    let spendable = (health - RESERVED_HEALTH_POINTS).floor() as i32;
+    crate::local::moves::SAFE_FALL.saturating_add(spendable.max(0))
+}
+
+fn remaining_falls_are_survivable(follower: &ActiveFollower, fall_limit: i32) -> bool {
+    let path = follower.path();
+    let index = follower.current_node_index();
+    path.nodes
+        .windows(2)
+        .enumerate()
+        .skip(index.saturating_sub(1))
+        .all(|(_, nodes)| {
+            !matches!(
+                nodes[1].reached_by,
+                crate::MoveKind::Fall | crate::MoveKind::Parkour { .. }
+            ) || nodes[0].pos.y.saturating_sub(nodes[1].pos.y) <= fall_limit
+        })
+}
+
 fn spawn_plan(
     request: NavigationRequest,
     start: BlockPos,
     world: std::sync::Arc<parking_lot::RwLock<azalea::world::World>>,
     settings: PathfinderSettings,
-    legs: u32,
-    stalled_legs: u32,
-    avoid: std::sync::Arc<std::collections::HashMap<BlockPos, crate::Cost>>,
+    leg: PlanLeg,
 ) -> Task<PlanResult> {
+    let PlanLeg {
+        journey_id,
+        legs,
+        stalled_legs,
+        avoid,
+        health,
+        adaptive,
+    } = leg;
     if crate::debug::navigation_enabled() {
         eprintln!(
             "nav plan leg {legs} from {start:?} with {} tolled blocks",
@@ -335,7 +717,9 @@ fn spawn_plan(
         let Ok(snapshot) = WorldSnapshot::try_capture(&world, lo, hi) else {
             return PlanResult {
                 request,
-                path: None,
+                journey_id,
+                plan: None,
+                observation_context: None,
                 reached_goal: false,
                 target,
                 legs,
@@ -346,7 +730,9 @@ fn spawn_plan(
         let Some(remaining) = total_budget.checked_sub(started.elapsed()) else {
             return PlanResult {
                 request,
-                path: None,
+                journey_id,
+                plan: None,
+                observation_context: None,
                 reached_goal: false,
                 target,
                 legs,
@@ -357,7 +743,9 @@ fn spawn_plan(
         if remaining.is_zero() {
             return PlanResult {
                 request,
-                path: None,
+                journey_id,
+                plan: None,
+                observation_context: None,
                 reached_goal: false,
                 target,
                 legs,
@@ -367,6 +755,8 @@ fn spawn_plan(
         }
         let mut context = settings.planner.clone();
         context.avoid = avoid;
+        context.max_fall = context.max_fall.min(survivable_fall_limit(health));
+        let baseline_costs = context.costs;
         // Re-seed per leg. The search is deterministic, so replanning from the
         // same block with the same seed returns the identical path, and a bot
         // wedged on a corner wedges on it again for every leg it has left.
@@ -383,7 +773,9 @@ fn spawn_plan(
         let Some(remaining) = total_budget.checked_sub(started.elapsed()) else {
             return PlanResult {
                 request,
-                path: None,
+                journey_id,
+                plan: None,
+                observation_context: None,
                 reached_goal: false,
                 target,
                 legs,
@@ -394,7 +786,9 @@ fn spawn_plan(
         if remaining.is_zero() {
             return PlanResult {
                 request,
-                path: None,
+                journey_id,
+                plan: None,
+                observation_context: None,
                 reached_goal: false,
                 target,
                 legs,
@@ -403,11 +797,55 @@ fn spawn_plan(
             };
         }
         context.time_budget_ms = remaining.as_millis().clamp(1, u128::from(u64::MAX)) as u64;
-        let (path, reached_goal) =
-            find_path_best_effort(&snapshot, start, target, &default_moves(), &context);
+        let moves = default_moves();
+        let planned = find_motion_plan_best_effort(
+            &snapshot,
+            start,
+            target,
+            &moves,
+            &context,
+            adaptive.as_ref().map(|adaptive| &adaptive.model),
+        );
+        let Ok((plan, reached_goal)) = planned else {
+            return PlanResult {
+                request,
+                journey_id,
+                plan: None,
+                observation_context: None,
+                reached_goal: false,
+                target,
+                legs,
+                stalled_legs,
+                start,
+            };
+        };
+        let observation_context = adaptive.as_ref().map(|adaptive| ObservationContext {
+            profile: adaptive.key.clone(),
+            journey_id,
+            generation: request.generation,
+            leg: legs,
+            plan_revision: request
+                .generation
+                .rotate_left(17)
+                .wrapping_add(u64::from(legs)),
+            world_revision: adaptive.world_revision,
+            model_revision: adaptive.model.model_revision,
+            planner_settings_hash: adaptive.regime.planner_settings_hash,
+            control_settings_hash: adaptive.regime.control_settings_hash,
+            baseline_costs_hash: movement_costs_hash(baseline_costs),
+            actor_capability_hash: adaptive.regime.actor_capability_hash,
+            build_id: adaptive.regime.build_id.clone(),
+            created_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| {
+                    duration.as_millis().min(u128::from(u64::MAX)) as u64
+                }),
+        });
         PlanResult {
             request,
-            path: Some(path),
+            journey_id,
+            plan: Some(plan),
+            observation_context,
             reached_goal,
             target,
             legs,
@@ -548,6 +986,8 @@ fn sanitize_profile_name(profile_name: &str) -> Option<String> {
 fn poll_navigation_tasks(
     mut commands: Commands,
     settings: Res<PathfinderSettings>,
+    adaptive_settings: Res<AdaptivePathfinderSettings>,
+    adaptive_runtime: Res<AdaptivePathfinderRuntime>,
     mut query: Query<(
         Entity,
         &NavigationRequest,
@@ -555,10 +995,11 @@ fn poll_navigation_tasks(
         &WorldHolder,
         Option<&AvoidMemory>,
         &Physics,
+        Option<&Health>,
         Option<&azalea::player::GameProfileComponent>,
     )>,
 ) {
-    for (entity, current, mut task, world_holder, avoid, physics, profile) in &mut query {
+    for (entity, current, mut task, world_holder, avoid, physics, health, profile) in &mut query {
         let avoid = avoid.map(AvoidMemory::snapshot).unwrap_or_default();
         let Some(result) = future::block_on(future::poll_once(&mut task.0)) else {
             continue;
@@ -567,7 +1008,7 @@ fn poll_navigation_tasks(
         if *current != result.request {
             continue;
         }
-        let Some(path) = result.path else {
+        let Some(plan) = result.plan else {
             commands.entity(entity).insert((
                 NavigationStatus::Failed {
                     generation: current.generation,
@@ -576,6 +1017,7 @@ fn poll_navigation_tasks(
             ));
             continue;
         };
+        let path = plan.path();
         if result.reached_goal && path.nodes.len() < 2 {
             commands.entity(entity).insert((
                 NavigationStatus::Arrived {
@@ -603,40 +1045,31 @@ fn poll_navigation_tasks(
             // bot was still in the air. Retrying without spending budget lets
             // the bot land and plan from somewhere real.
             //
-            // A ladder is not mid-fall, though. `on_ground` is false for the
-            // whole of a climb, so a bot on one was exempt from the budget
-            // forever: it climbed, walked out of the shaft, fell, replanned and
-            // climbed again, and a single navigation ran for over ten minutes
-            // without ever reporting Failed. The exemption is for a body in
-            // flight with nothing under it, which is a state that ends by
-            // itself in under a second; hanging on a ladder is somewhere the
-            // planner can reason about perfectly well.
-            let on_ladder = {
-                use crate::local::world::WorldView;
+            // A ladder or water column is not mid-fall, though. `on_ground` is
+            // false throughout both, so treating either as airborne exempts a
+            // dead-end climb/swim from the retry budget forever. The exemption
+            // is only for a body in free flight, a state that ends by itself
+            // quickly; sustained climb/swim states are places the planner can
+            // reason about and must consume bounded retries.
+            let airborne = {
                 let world = world_holder.shared.read();
-                world.block(result.start) == crate::local::world::BlockKind::Climbable
+                is_transient_free_fall(&*world, result.start, physics.on_ground())
             };
-            let airborne = !physics.on_ground() && !on_ladder;
-            let stalled_legs = if airborne {
-                result.stalled_legs
-            } else {
-                result.stalled_legs.saturating_add(1)
-            };
-            let legs = if airborne {
-                result.legs
-            } else {
-                result.legs.saturating_add(1)
-            };
-            if !airborne
-                && (stalled_legs > MAX_STALLED_LEGS || result.legs >= settings.max_plan_legs.max(1))
-            {
+            let Some((legs, stalled_legs)) = next_stalled_retry(
+                result.legs,
+                result.stalled_legs,
+                settings.max_plan_legs,
+                airborne,
+            ) else {
                 commands.entity(entity).insert((
                     NavigationStatus::Failed {
                         generation: current.generation,
                     },
                     NavigationTerminal,
                 ));
-            } else {
+                continue;
+            };
+            {
                 // Straight back to the planner with a fresh seed rather than
                 // handing the follower a path to nowhere.
                 let task = spawn_plan(
@@ -644,9 +1077,18 @@ fn poll_navigation_tasks(
                     result.start,
                     world_holder.shared.clone(),
                     settings.clone(),
-                    legs,
-                    stalled_legs,
-                    avoid.clone(),
+                    PlanLeg {
+                        journey_id: result.journey_id,
+                        legs,
+                        stalled_legs,
+                        avoid: avoid.clone(),
+                        health: health.map_or(0.0, |health| health.0),
+                        adaptive: adaptive_leg_seed(
+                            &adaptive_settings,
+                            &adaptive_runtime,
+                            &settings,
+                        ),
+                    },
                 );
                 commands.entity(entity).insert((
                     NavigationTask(task),
@@ -679,16 +1121,31 @@ fn poll_navigation_tasks(
         // watching. Written here, on every (re)plan, so what the player sees
         // ingame is exactly the route the follower is about to walk - and it
         // refreshes the instant the bot changes its mind.
-        write_path_viz(profile, current.goal.position(), &path);
-        let follower = PathFollower::new(path, settings.follower.clone(), current.path_seed);
+        write_path_viz(profile, current.goal.position(), path);
+        let follower = if let Some(context) = result.observation_context {
+            ActiveFollower::Observed(Box::new(ObservedPathFollower::new(
+                plan,
+                settings.follower.clone(),
+                current.path_seed,
+                context,
+            )))
+        } else {
+            ActiveFollower::Plain(Box::new(PathFollower::new(
+                plan.into_path(),
+                settings.follower.clone(),
+                current.path_seed,
+            )))
+        };
         commands.entity(entity).insert((
             ActiveNavigation {
                 follower,
+                journey_id: result.journey_id,
                 reached_goal: result.reached_goal,
                 planned_goal: result.target,
                 legs: result.legs,
                 stalled_legs: 0,
                 dynamic_ticks: 0,
+                checked_fall_limit: i32::MIN,
             },
             NavigationStatus::Following {
                 generation: current.generation,
@@ -702,6 +1159,8 @@ fn poll_navigation_tasks(
 fn tick_navigation(
     mut commands: Commands,
     settings: Res<PathfinderSettings>,
+    adaptive_settings: Res<AdaptivePathfinderSettings>,
+    adaptive_runtime: Res<AdaptivePathfinderRuntime>,
     mut query: Query<(
         Entity,
         &NavigationRequest,
@@ -711,6 +1170,7 @@ fn tick_navigation(
         &mut LookDirection,
         &WorldHolder,
         Option<&Hunger>,
+        Option<&Health>,
         &mut ActiveNavigation,
         Option<&mut AvoidMemory>,
     )>,
@@ -727,6 +1187,7 @@ fn tick_navigation(
         mut look,
         world_holder,
         hunger,
+        health,
         mut active,
         mut avoid,
     ) in &mut query
@@ -743,11 +1204,69 @@ fn tick_navigation(
                 },
             );
             debug_assert_eq!(directive, FollowerDirective::Paused);
+            record_observations(
+                &mut active.follower,
+                &adaptive_runtime,
+                &adaptive_settings.learner,
+            );
             stop(entity, &mut walk_events);
             commands.entity(entity).insert(NavigationStatus::Paused {
                 generation: request.generation,
             });
             continue;
+        }
+
+        let live_health = health.map_or(0.0, |health| health.0);
+        let live_fall_limit = survivable_fall_limit(live_health);
+        let fall_limit_changed = active.checked_fall_limit != live_fall_limit;
+        let remaining_falls_safe = !fall_limit_changed
+            || remaining_falls_are_survivable(&active.follower, live_fall_limit);
+        if fall_limit_changed && remaining_falls_safe {
+            active.checked_fall_limit = live_fall_limit;
+        }
+        if physics.on_ground() && !remaining_falls_safe {
+            active.follower.interrupt(InterruptionReason::WorldChanged);
+            record_observations(
+                &mut active.follower,
+                &adaptive_runtime,
+                &adaptive_settings.learner,
+            );
+            stop(entity, &mut walk_events);
+            let task = spawn_plan(
+                *request,
+                BlockPos::from(&**position),
+                world_holder.shared.clone(),
+                settings.clone(),
+                PlanLeg {
+                    journey_id: active.journey_id,
+                    legs: active.legs,
+                    stalled_legs: active.stalled_legs,
+                    avoid: avoid
+                        .as_deref()
+                        .map(AvoidMemory::snapshot)
+                        .unwrap_or_default(),
+                    health: live_health,
+                    adaptive: adaptive_leg_seed(&adaptive_settings, &adaptive_runtime, &settings),
+                },
+            );
+            commands.entity(entity).remove::<ActiveNavigation>();
+            commands.entity(entity).insert((
+                NavigationTask(task),
+                NavigationStatus::Planning {
+                    generation: request.generation,
+                },
+            ));
+            continue;
+        }
+
+        // Low hunger changes the executor from requested sprinting to walking,
+        // which is a different timing regime. Keep following safely, but do
+        // not let that partial leg contaminate sprint-capable calibration.
+        let can_sprint = hunger.is_none_or(|hunger| hunger.food > 6);
+        if !can_sprint {
+            active
+                .follower
+                .disable_observations(InterruptionReason::Unknown);
         }
 
         // Check nearby blocks again before following the planned path.
@@ -758,6 +1277,12 @@ fn tick_navigation(
             &settings.follower,
         );
         let Ok(live_snapshot) = WorldSnapshot::try_capture(&world_holder.shared, low, high) else {
+            active.follower.interrupt(InterruptionReason::WorldChanged);
+            record_observations(
+                &mut active.follower,
+                &adaptive_runtime,
+                &adaptive_settings.learner,
+            );
             stop(entity, &mut walk_events);
             commands.entity(entity).remove::<ActiveNavigation>();
             commands.entity(entity).insert((
@@ -776,6 +1301,11 @@ fn tick_navigation(
                 horizontal_collision: physics.horizontal_collision,
                 paused: false,
             },
+        );
+        record_observations(
+            &mut active.follower,
+            &adaptive_runtime,
+            &adaptive_settings.learner,
         );
         match directive {
             FollowerDirective::Paused => {
@@ -806,7 +1336,6 @@ fn tick_navigation(
                 // Vanilla refuses to start a sprint at 6 hunger or less, so
                 // sprinting through it is a movement the server cannot
                 // reproduce. Grim reports it as SprintA.
-                let can_sprint = hunger.is_none_or(|hunger| hunger.food > 6);
                 if sprint && can_sprint {
                     sprint_events.write(StartSprintEvent {
                         entity,
@@ -904,9 +1433,18 @@ fn tick_navigation(
                         BlockPos::from(&**position),
                         world_holder.shared.clone(),
                         settings.clone(),
-                        active.legs.saturating_add(1),
-                        active.stalled_legs,
-                        avoid,
+                        PlanLeg {
+                            journey_id: active.journey_id,
+                            legs: active.legs.saturating_add(1),
+                            stalled_legs: active.stalled_legs,
+                            avoid,
+                            health: health.map_or(0.0, |health| health.0),
+                            adaptive: adaptive_leg_seed(
+                                &adaptive_settings,
+                                &adaptive_runtime,
+                                &settings,
+                            ),
+                        },
                     );
                     commands.entity(entity).remove::<ActiveNavigation>();
                     commands.entity(entity).insert((
@@ -926,17 +1464,28 @@ fn tick_navigation(
             && active.dynamic_ticks >= settings.dynamic_replan_ticks
         {
             stop(entity, &mut walk_events);
+            active.follower.interrupt(InterruptionReason::GoalChanged);
+            record_observations(
+                &mut active.follower,
+                &adaptive_runtime,
+                &adaptive_settings.learner,
+            );
             let task = spawn_plan(
                 *request,
                 BlockPos::from(&**position),
                 world_holder.shared.clone(),
                 settings.clone(),
-                active.legs,
-                active.stalled_legs,
-                avoid
-                    .as_deref()
-                    .map(AvoidMemory::snapshot)
-                    .unwrap_or_default(),
+                PlanLeg {
+                    journey_id: active.journey_id,
+                    legs: active.legs,
+                    stalled_legs: active.stalled_legs,
+                    avoid: avoid
+                        .as_deref()
+                        .map(AvoidMemory::snapshot)
+                        .unwrap_or_default(),
+                    health: health.map_or(0.0, |health| health.0),
+                    adaptive: adaptive_leg_seed(&adaptive_settings, &adaptive_runtime, &settings),
+                },
             );
             commands.entity(entity).remove::<ActiveNavigation>();
             commands.entity(entity).insert((
@@ -959,8 +1508,10 @@ fn stop(entity: Entity, events: &mut MessageWriter<StartWalkEvent>) {
 #[allow(clippy::type_complexity)]
 fn stop_removed_navigation(
     mut commands: Commands,
-    query: Query<
-        Entity,
+    adaptive_settings: Res<AdaptivePathfinderSettings>,
+    adaptive_runtime: Res<AdaptivePathfinderRuntime>,
+    mut query: Query<
+        (Entity, Option<&mut ActiveNavigation>),
         (
             With<LocalEntity>,
             Without<NavigationRequest>,
@@ -973,7 +1524,15 @@ fn stop_removed_navigation(
     >,
     mut walk_events: MessageWriter<StartWalkEvent>,
 ) {
-    for entity in &query {
+    for (entity, active) in &mut query {
+        if let Some(mut active) = active {
+            active.follower.interrupt(InterruptionReason::Cancelled);
+            record_observations(
+                &mut active.follower,
+                &adaptive_runtime,
+                &adaptive_settings.learner,
+            );
+        }
         stop(entity, &mut walk_events);
         commands
             .entity(entity)
@@ -1140,6 +1699,78 @@ impl AzaleaPathfinderClientExt for Client {
 mod tests {
     use super::*;
 
+    fn adaptive_test_settings() -> AdaptiveSettings {
+        AdaptiveSettings {
+            mode: AdaptiveMode::Enabled,
+            min_samples: 3,
+            maximum_failure_upper_ppm: 900_000,
+            minimum_evaluation_journeys: 2,
+            ..AdaptiveSettings::default()
+        }
+    }
+
+    fn adaptive_test_regime(key: &ProfileKey, pathfinder: &PathfinderSettings) -> AdaptiveRegime {
+        AdaptiveRegime {
+            build_id: "plugin-test".into(),
+            planner_settings_hash: move_context_hash(&pathfinder.planner),
+            control_settings_hash: follower_settings_hash(&observed_follower_settings(
+                pathfinder.follower.clone(),
+            )),
+            baseline_costs_hash: movement_costs_hash(pathfinder.planner.costs),
+            actor_capability_hash: key.capability_hash,
+        }
+    }
+
+    fn adaptive_test_observation(
+        key: &ProfileKey,
+        regime: &AdaptiveRegime,
+        edge_index: u32,
+    ) -> MoveObservation {
+        crate::MoveAttempt::begin(
+            ObservationContext {
+                profile: key.clone(),
+                journey_id: 1,
+                generation: 1,
+                leg: 1,
+                plan_revision: 1,
+                world_revision: 1,
+                model_revision: 0,
+                planner_settings_hash: regime.planner_settings_hash,
+                control_settings_hash: regime.control_settings_hash,
+                baseline_costs_hash: regime.baseline_costs_hash,
+                actor_capability_hash: regime.actor_capability_hash,
+                build_id: regime.build_id.clone(),
+                created_unix_ms: 1,
+            },
+            crate::ObservationId {
+                nonce: next_observation_nonce(),
+                journey_id: 1,
+                generation: 1,
+                leg: 1,
+                edge_index,
+                attempt: 0,
+            },
+            crate::PrimitiveId::WALK_CARDINAL,
+            crate::MoveFeatures::new(1, 0, crate::adaptive::TerrainClass::FullBlock),
+            BlockPos::new(edge_index as i32, 64, 0),
+            BlockPos::new(edge_index as i32 + 1, 64, 0),
+            crate::CostComponents {
+                time: 10,
+                ..crate::CostComponents::default()
+            },
+            5,
+            0,
+        )
+        .unwrap()
+        .finish(
+            10,
+            u64::from(edge_index) + 1,
+            crate::ObservationOutcome::Success,
+            crate::AttributionEvidence::ReachedPlannedNode,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn snapshot_bounds_cap_far_goal_in_its_direction() {
         let settings = PathfinderSettings {
@@ -1195,6 +1826,206 @@ mod tests {
             goal,
             1
         ));
+    }
+
+    #[test]
+    fn health_caps_falls_with_a_two_heart_reserve() {
+        assert_eq!(survivable_fall_limit(f32::NAN), 3);
+        assert_eq!(survivable_fall_limit(4.0), 3);
+        assert_eq!(survivable_fall_limit(5.9), 4);
+        assert_eq!(survivable_fall_limit(20.0), 19);
+    }
+
+    #[test]
+    fn journey_ids_are_unique_across_actors() {
+        let first_runtime = AdaptivePathfinderRuntime::default();
+        let second_runtime = AdaptivePathfinderRuntime::default();
+        let first = first_runtime.allocate_journey_id();
+        let second = second_runtime.allocate_journey_id();
+        let third = first_runtime.allocate_journey_id();
+        assert_ne!(first, 0);
+        assert_ne!(first, second);
+        assert_ne!(first, third);
+        assert_ne!(second, third);
+    }
+
+    #[test]
+    fn adaptive_seed_rejects_disabled_or_wrong_capability_and_is_health_independent() {
+        let runtime = AdaptivePathfinderRuntime::default();
+        let pathfinder = PathfinderSettings::default();
+        let mut adaptive = AdaptivePathfinderSettings {
+            profile: Some(ProfileKey::local_default()),
+            learner: adaptive_test_settings(),
+            build_id: "plugin-test".into(),
+            ..AdaptivePathfinderSettings::default()
+        };
+        let first = adaptive_leg_seed(&adaptive, &runtime, &pathfinder).unwrap();
+        let second = adaptive_leg_seed(&adaptive, &runtime, &pathfinder).unwrap();
+        assert_eq!(first.regime, second.regime);
+        assert_eq!(
+            first.regime.planner_settings_hash,
+            move_context_hash(&pathfinder.planner),
+            "per-leg health caps must not enter the persistent regime"
+        );
+
+        adaptive.actor_capability_hash = 1;
+        assert!(adaptive_leg_seed(&adaptive, &runtime, &pathfinder).is_none());
+        adaptive.actor_capability_hash = 0;
+        adaptive.learner.mode = AdaptiveMode::Disabled;
+        assert!(adaptive_leg_seed(&adaptive, &runtime, &pathfinder).is_none());
+    }
+
+    #[test]
+    fn a_live_health_drop_invalidates_an_upcoming_damaging_fall() {
+        let path = crate::Path {
+            nodes: vec![
+                crate::PathNode {
+                    pos: BlockPos::new(0, 64, 0),
+                    reached_by: crate::MoveKind::Start,
+                },
+                crate::PathNode {
+                    pos: BlockPos::new(1, 54, 0),
+                    reached_by: crate::MoveKind::Fall,
+                },
+            ],
+            total_cost: 10,
+        };
+        let follower = ActiveFollower::Plain(Box::new(PathFollower::new(
+            path,
+            FollowerSettings::default(),
+            0,
+        )));
+        assert!(remaining_falls_are_survivable(
+            &follower,
+            survivable_fall_limit(20.0)
+        ));
+        assert!(!remaining_falls_are_survivable(
+            &follower,
+            survivable_fall_limit(10.0)
+        ));
+    }
+
+    #[test]
+    fn swimming_is_not_an_unbounded_free_fall_retry() {
+        struct WaterWorld;
+        impl WorldView for WaterWorld {
+            fn block(&self, _position: BlockPos) -> crate::BlockKind {
+                crate::BlockKind::Water
+            }
+        }
+        struct AirWorld;
+        impl WorldView for AirWorld {
+            fn block(&self, _position: BlockPos) -> crate::BlockKind {
+                crate::BlockKind::Air
+            }
+        }
+
+        let position = BlockPos::new(0, 64, 0);
+        assert!(!is_transient_free_fall(&WaterWorld, position, false));
+        assert!(is_transient_free_fall(&AirWorld, position, false));
+
+        let mut state = (1, 0);
+        let mut retries = 0;
+        while let Some(next) = next_stalled_retry(state.0, state.1, 100, false) {
+            state = next;
+            retries += 1;
+            assert!(retries <= MAX_STALLED_LEGS);
+        }
+        assert_eq!(retries, MAX_STALLED_LEGS);
+        assert_eq!(
+            next_stalled_retry(1, 0, 100, true),
+            Some((1, 0)),
+            "only genuine short-lived free fall keeps the retry budget"
+        );
+    }
+
+    #[test]
+    fn invalid_observations_do_not_allocate_profiles_and_capacity_is_bounded() {
+        let runtime = AdaptivePathfinderRuntime::default();
+        let key = ProfileKey::local_default();
+        let pathfinder = PathfinderSettings::default();
+        let regime = adaptive_test_regime(&key, &pathfinder);
+        let mut invalid = adaptive_test_observation(&key, &regime, 0);
+        invalid.schema = 0;
+        assert!(!runtime.try_observe(&invalid, &adaptive_test_settings()));
+        assert!(runtime.profiles.lock().is_empty());
+
+        for index in 0..MAX_ADAPTIVE_PROFILES {
+            let mut key = ProfileKey::local_default();
+            key.server = format!("server-{index}");
+            runtime
+                .install_profile(
+                    AdaptiveProfile::new(key),
+                    ProfileInstallPolicy::RejectExisting,
+                )
+                .unwrap();
+        }
+        let mut overflow = ProfileKey::local_default();
+        overflow.server = "overflow".into();
+        assert!(matches!(
+            runtime.install_profile(
+                AdaptiveProfile::new(overflow),
+                ProfileInstallPolicy::RejectExisting
+            ),
+            Err(ProfileError::Capacity)
+        ));
+    }
+
+    #[test]
+    fn persisted_promoted_model_can_be_restored_explicitly() {
+        let key = ProfileKey::local_default();
+        let pathfinder = PathfinderSettings::default();
+        let regime = adaptive_test_regime(&key, &pathfinder);
+        let settings = adaptive_test_settings();
+        let runtime = AdaptivePathfinderRuntime::default();
+        for edge in 0..3 {
+            assert!(
+                runtime.try_observe(&adaptive_test_observation(&key, &regime, edge), &settings)
+            );
+        }
+        let profile = runtime.profile(&key).unwrap();
+        let known_good = crate::JourneyMetrics {
+            journeys: 10,
+            failed: 0,
+            p95_ticks: 100,
+            damage_half_hearts: 0,
+            setbacks: 0,
+            corrections: 0,
+            disconnects: 0,
+        };
+        let report = PromotionReport {
+            evaluation_id: 1,
+            candidate_data_revision: profile.data_revision,
+            expected_model_revision: profile.model_revision(),
+            candidate_hash: profile.candidate_hash(&settings),
+            known_good,
+            shadow: crate::JourneyMetrics {
+                p95_ticks: 99,
+                ..known_good
+            },
+        };
+        assert_eq!(runtime.promote(&key, &report, &settings).unwrap(), 1);
+
+        let root = std::env::temp_dir().join(format!(
+            "azalea-pathfinder-runtime-profile-{}-{}",
+            std::process::id(),
+            next_observation_nonce()
+        ));
+        crate::save_profile_atomic(&root, &runtime.profile(&key).unwrap()).unwrap();
+        let restored = AdaptivePathfinderRuntime::default();
+        restored
+            .load_from(&root, &key, ProfileInstallPolicy::RejectExisting)
+            .unwrap();
+        let snapshot = restored.snapshot(&key, pathfinder.planner.costs, &settings, &regime);
+        assert_eq!(snapshot.model_revision, 1);
+        assert!(
+            snapshot.edge_cost(
+                crate::PrimitiveId::WALK_CARDINAL,
+                crate::MoveFeatures::new(1, 0, crate::adaptive::TerrainClass::FullBlock),
+                10
+            ) > 10
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

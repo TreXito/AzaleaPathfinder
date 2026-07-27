@@ -157,6 +157,32 @@ pub enum FollowerDirective {
     },
 }
 
+/// Cursor movement produced by the most recent follower tick.
+///
+/// Adaptive telemetry uses this to distinguish an edge actually reached from
+/// nodes skipped during a correction/re-anchor. A skipped node is never
+/// reported as a successful primitive.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FollowerProgress {
+    #[default]
+    None,
+    Advanced {
+        from: usize,
+        to: usize,
+    },
+    Reanchored {
+        from: usize,
+        to: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowerFailure {
+    TimedOut,
+    FellOff,
+    Stalled,
+}
+
 #[derive(Debug, Clone)]
 pub struct PathFollower {
     path: Path,
@@ -176,6 +202,8 @@ pub struct PathFollower {
     pitch_phase: f32,
     max_turn: f32,
     rng: Rng,
+    last_progress: FollowerProgress,
+    last_failure: Option<FollowerFailure>,
 }
 
 impl PathFollower {
@@ -215,6 +243,8 @@ impl PathFollower {
             yaw_phase,
             pitch_phase,
             rng,
+            last_progress: FollowerProgress::None,
+            last_failure: None,
         }
     }
 
@@ -245,7 +275,17 @@ impl PathFollower {
         self.idx
     }
 
+    pub fn take_progress(&mut self) -> FollowerProgress {
+        std::mem::take(&mut self.last_progress)
+    }
+
+    pub fn take_failure(&mut self) -> Option<FollowerFailure> {
+        self.last_failure.take()
+    }
+
     pub fn tick(&mut self, world: &dyn WorldView, frame: FollowerFrame) -> FollowerDirective {
+        self.last_progress = FollowerProgress::None;
+        self.last_failure = None;
         if self.path.nodes.len() < 2 {
             return FollowerDirective::Arrived;
         }
@@ -255,6 +295,7 @@ impl PathFollower {
         }
         self.total_ticks = self.total_ticks.saturating_add(1);
         if self.total_ticks > self.settings.max_follow_ticks.max(1) {
+            self.last_failure = Some(FollowerFailure::TimedOut);
             return FollowerDirective::Stuck {
                 at: BlockPos::from(&frame.position),
             };
@@ -280,7 +321,12 @@ impl PathFollower {
             if dist_xz(frame.position, candidate) + self.settings.node_radius_xz.max(0.0)
                 < dist_xz(frame.position, current)
             {
+                let previous = self.idx;
                 self.idx = reanchored;
+                self.last_progress = FollowerProgress::Reanchored {
+                    from: previous,
+                    to: reanchored,
+                };
                 self.last_progress_idx = reanchored;
                 self.stalled = 0;
             }
@@ -301,11 +347,17 @@ impl PathFollower {
         ) && let Some(reanchored) =
             nearest_safe_prefix_node(world, frame.position, nodes, self.idx, &self.settings)
         {
+            let previous = self.idx;
             self.idx = reanchored;
+            self.last_progress = FollowerProgress::Reanchored {
+                from: previous,
+                to: reanchored,
+            };
             self.last_progress_idx = reanchored;
             self.stalled = 0;
         }
 
+        let advancement_start = self.idx;
         while self.idx + 1 < nodes.len() {
             let current = node_center(nodes[self.idx].pos);
             let next = node_center(nodes[self.idx + 1].pos);
@@ -319,6 +371,14 @@ impl PathFollower {
             } else {
                 break;
             }
+        }
+        if self.idx != advancement_start
+            && !matches!(self.last_progress, FollowerProgress::Reanchored { .. })
+        {
+            self.last_progress = FollowerProgress::Advanced {
+                from: advancement_start,
+                to: self.idx,
+            };
         }
 
         let final_target = node_center(nodes[nodes.len() - 1].pos);
@@ -345,6 +405,7 @@ impl PathFollower {
         // bot having a fit, and it is really a bot obeying an itinerary that
         // stopped applying the moment it fell.
         if frame.on_ground && f64::from(next.y) - frame.position.y > FELL_OFF_PATH {
+            self.last_failure = Some(FollowerFailure::FellOff);
             return FollowerDirective::Stuck {
                 at: BlockPos::from(&frame.position),
             };
@@ -466,6 +527,7 @@ impl PathFollower {
                         max_turn: self.max_turn,
                     };
                 }
+                self.last_failure = Some(FollowerFailure::Stalled);
                 return FollowerDirective::Stuck {
                     at: BlockPos::from(&frame.position),
                 };
