@@ -5,7 +5,7 @@ edition = "2024"
 description = "Reusable block pathfinding and navigation plugin for Azalea clients"
 
 [dependencies]
-azalea = { git = "https://github.com/RaymondShell/azalea", branch = "main" }
+azalea = { path = "../azalea/azalea" }
 bevy_ecs = "0.19"
 bevy_tasks = { version = "0.19", features = ["multi_threaded"] }
 futures-lite = "2"
